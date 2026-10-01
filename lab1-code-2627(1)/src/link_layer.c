@@ -5,12 +5,25 @@
 #include "link_layer.h"
 #include "serial_port.h"
 
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
+
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+
+void alarmHandler(int signal)
+{
+    (void)signal;
+    alarmEnabled = FALSE;
+    alarmCount++;
+    printf("Alarm #%d received\n", alarmCount);
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -30,21 +43,60 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Create string to send
-    unsigned char buf[BUF_SIZE] = {0};
-
-    for (int i = 0; i < BUF_SIZE; i++)
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
     {
-        buf[i] = 'a' + i % 26;
+        perror("sigaction");
+        exit(1);
     }
 
-    // In non-canonical mode, '\n' does not end the writing.
-    // Test this condition by placing a '\n' in the middle of the buffer.
-    // The whole buffer must be sent even with the '\n'.
-    buf[5] = '\n';
+    int retries = 0;
+    while (retries <= llParameters.nRetransmissions)
+    {
+        unsigned char frame[5] = {0};
+        unsigned char packet[5] = {0};
 
-    int bytes = writeBytesSerialPort(buf, BUF_SIZE);
-    printf("%d bytes written to serial port\n", bytes);
+        frame[0] = 0x7E;
+        frame[1] = 0x03;
+        frame[2] = 0x03;
+        frame[3] = 0x03 ^ 0x03;
+        frame[4] = 0x7E;
+
+        alarm(0);
+        alarmEnabled = FALSE;
+
+        int bytes = writeBytesSerialPort(frame, 5);
+        printf("%d bytes written to serial port\n", bytes);
+
+        alarm(llParameters.timeout);
+        alarmEnabled = TRUE;
+
+        int received = llReceive(packet);
+        if (received == 5 && packet[0] == 0x7E && packet[4] == 0x7E && packet[1] == 0x03 && packet[2] == 0x07 && ((packet[1] ^ packet[2]) == packet[3]))
+        {
+            alarm(0);
+            alarmEnabled = FALSE;
+            printf("UA received. Connection established.\n");
+            break;
+        }
+
+        if (alarmEnabled == FALSE)
+        {
+            printf("Timeout waiting for UA. Retransmitting SET.\n");
+            retries++;
+            if (retries > llParameters.nRetransmissions)
+            {
+                alarm(0);
+                closeSerialPort();
+                fprintf(stderr, "Maximum number of retransmissions reached.\n");
+                return -1;
+            }
+            continue;
+        }
+
+        retries++;
+    }
 
     // Wait until all bytes have been written to the serial port
     sleep(1);
@@ -122,6 +174,9 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
+    (void)buf;
+    (void)bufSize;
+
     // Build a supervision frame for connection establishment (SET)
     // Frame format: |F|A|C|BCC1|F|
     // FLAG: 0x7E
@@ -171,8 +226,9 @@ int llReceive(unsigned char *packet)
     const unsigned char FLAG = 0x7E;
     unsigned char buf[5];
     int idx = 0;
+    int state = 0;
 
-    while (idx < 5)
+    while (1)
     {
         unsigned char byte = 0;
         int r = readByteSerialPort(&byte);
@@ -187,42 +243,81 @@ int llReceive(unsigned char *packet)
             continue;
         }
 
-        // Store byte
-        buf[idx++] = byte;
+        switch (state)
+        {
+            case 0: // START
+                if (byte == FLAG)
+                {
+                    buf[idx++] = byte;
+                    state = 1;
+                }
+                break;
+
+            case 1: // FLAG_RCV
+                if (byte == 0x03)
+                {
+                    buf[idx++] = byte;
+                    state = 2;
+                }
+                else if (byte == FLAG)
+                {
+                    idx = 1;
+                    buf[0] = FLAG;
+                }
+                else
+                {
+                    idx = 0;
+                    state = 0;
+                }
+                break;
+
+            case 2: // A_RCV
+                if (byte == 0x03)
+                {
+                    buf[idx++] = byte;
+                    state = 3;
+                }
+                else
+                {
+                    idx = 0;
+                    state = 0;
+                }
+                break;
+
+            case 3: // C_RCV
+                buf[idx++] = byte;
+                state = 4;
+                break;
+
+            case 4: // BCC_RCV
+                if (byte == FLAG)
+                {
+                    buf[idx++] = byte;
+
+                    if (idx == 5 &&
+                        buf[0] == FLAG &&
+                        buf[4] == FLAG &&
+                        buf[1] == 0x03 &&
+                        buf[2] == 0x03 &&
+                        ((buf[1] ^ buf[2]) == buf[3]))
+                    {
+                        for (int i = 0; i < 5; i++)
+                            packet[i] = buf[i];
+
+                        return 5;
+                    }
+
+                    idx = 0;
+                    state = 0;
+                }
+                else
+                {
+                    idx = 0;
+                    state = 0;
+                }
+                break;
+        }
     }
-
-    // Debug: print received bytes in hexadecimal
-    for (int i = 0; i < 5; i++)
-    {
-        printf("recv[%d] = 0x%02X\n", i, (unsigned int)(buf[i] & 0xFF));
-    }
-
-    // Basic validation: first and last must be FLAG
-    if (buf[0] != FLAG || buf[4] != FLAG)
-    {
-        fprintf(stderr, "Invalid supervision frame: missing FLAG\n");
-        return -1;
-    }
-
-    // Validate BCC1 (A ^ C)
-    unsigned char A = buf[1];
-    unsigned char C = buf[2];
-    unsigned char BCC1 = buf[3];
-
-    // Debug: print header fields
-    printf("A = 0x%02X, C = 0x%02X, BCC1 = 0x%02X\n", (unsigned int)(A & 0xFF), (unsigned int)(C & 0xFF), (unsigned int)(BCC1 & 0xFF));
-
-    if ((A ^ C) != BCC1)
-    {
-        fprintf(stderr, "Invalid supervision frame: BCC1 mismatch\n");
-        return -1;
-    }
-
-    // Copy validated frame into packet (5 bytes)
-    for (int i = 0; i < 5; i++)
-        packet[i] = buf[i];
-
-    return 5;
 }
 
 ////////////////////////////////////////////////
