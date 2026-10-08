@@ -1,6 +1,8 @@
 // RCOM 2026/2027
 //
 // Link layer protocol implementation
+// This module implements the connection establishment and
+// supervision frame handling required by the serial protocol.
 
 #include "link_layer.h"
 #include "serial_port.h"
@@ -29,6 +31,9 @@ void alarmHandler(int signal)
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
+// Validate a 5-byte supervision frame in the format: F A C BCC1 F.
+// The expected control field depends on whether we are checking for SET (0x03)
+// or UA (0x07). For these frames, BCC1 = A ^ C.
 static int isValidSupervisionFrame(const unsigned char *frame, int frameSize, unsigned char expectedControl)
 {
     if (frameSize != 5)
@@ -43,6 +48,7 @@ static int isValidSupervisionFrame(const unsigned char *frame, int frameSize, un
     return ((frame[1] ^ frame[2]) == frame[3]);
 }
 
+// Send a supervision frame with the given control byte.
 static int sendSupervisionFrame(unsigned char control)
 {
     unsigned char frame[5] = {0};
@@ -55,6 +61,7 @@ static int sendSupervisionFrame(unsigned char control)
     return writeBytesSerialPort(frame, 5);
 }
 
+// Open the serial port as transmitter and perform the SET/UA handshake.
 int llOpenTx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -122,6 +129,7 @@ int llOpenTx(LinkLayer llParameters)
     return -1;
 }
 
+// Open the serial port as receiver and wait for a SET frame from the transmitter.
 int llOpenRx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -161,6 +169,7 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 // LLSEND
 ////////////////////////////////////////////////
+// Send raw bytes over the open serial link.
 int llSend(const unsigned char *buf, int bufSize)
 {
     if (buf == NULL || bufSize <= 0)
@@ -174,6 +183,7 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 // LLRECEIVE
 ////////////////////////////////////////////////
+// Receive one valid supervision frame from the serial port.
 int llReceive(unsigned char *packet)
 {
     if (packet == NULL)
@@ -229,6 +239,7 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
+// Close the transmitter port after the communication is complete.
 int llCloseTx()
 {
     if (closeSerialPort() < 0)
@@ -241,6 +252,7 @@ int llCloseTx()
     return 0;
 }
 
+// Close the receiver port after the communication is complete.
 int llCloseRx()
 {
     if (closeSerialPort() < 0)

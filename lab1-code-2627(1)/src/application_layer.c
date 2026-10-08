@@ -1,6 +1,8 @@
 // RCOM 2026/2027
 //
 // Application layer protocol implementation
+// This layer sends or receives the file metadata and payload after
+// the link-layer handshake has been completed.
 
 #include "application_layer.h"
 #include "link_layer.h"
@@ -11,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Read exactly 'length' bytes from the serial port.
 static int readExactly(unsigned char *buffer, int length)
 {
     int total = 0;
@@ -34,6 +37,7 @@ static int readExactly(unsigned char *buffer, int length)
     return total;
 }
 
+// Write exactly 'length' bytes to the serial port.
 static int writeExactly(const unsigned char *buffer, int length)
 {
     int total = 0;
@@ -57,6 +61,9 @@ static int writeExactly(const unsigned char *buffer, int length)
     return total;
 }
 
+// Main application entry point. The role selects whether the process acts as
+// a sender or a receiver. After the connection setup, the file size and bytes
+// are exchanged over the established serial link.
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
