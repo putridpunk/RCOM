@@ -6,6 +6,7 @@
 
 #include "link_layer.h"
 #include "serial_port.h"
+#include "alarm_sigaction.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -17,7 +18,7 @@
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
 
-int alarmEnabled = FALSE;
+/*int alarmEnabled = FALSE;
 int alarmCount = 0;
 
 void alarmHandler(int signal)
@@ -26,7 +27,7 @@ void alarmHandler(int signal)
     alarmEnabled = FALSE;
     alarmCount++;
     printf("Alarm #%d received\n", alarmCount);
-}
+}*/
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -72,48 +73,47 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1)
+    if (setupAlarmHandler() == -1) 
     {
-        perror("sigaction");
+        perror("setupAlarmHandler")
         return -1;
     }
 
     int retries = 0;
-    while (retries <= llParameters.nRetransmissions)
+    while (retries <= llParameters.nRetransmissions) 
     {
         unsigned char packet[5] = {0};
 
-        alarm(0);
-        alarmEnabled = FALSE;
+        stopAlarm();
 
-        if (sendSupervisionFrame(0x03) < 0)
+        if (sendSupervisionFrame(0x03) < 0) 
         {
             perror("writeBytesSerialPort");
             closeSerialPort();
             return -1;
         }
 
-        alarm(llParameters.timeout);
-        alarmEnabled = TRUE;
+        startAlarm(llParameters.timeout);
 
-        int received = llReceive(packet);
+        //int received = llReceive(packet);
+        // ================================
+        // TODO: receive and count received
+        // ================================
+
         if (received == 5 && isValidSupervisionFrame(packet, received, 0x07))
         {
-            alarm(0);
-            alarmEnabled = FALSE;
+            stopAlarm();
             printf("UA received. Connection established.\n");
             return 0;
         }
 
-        if (alarmEnabled == FALSE)
+        if (isAlarmActive() == FALSE)
         {
             printf("Timeout waiting for UA. Retransmitting SET.\n");
             retries++;
             if (retries > llParameters.nRetransmissions)
             {
-                alarm(0);
+                stopAlarm();
                 closeSerialPort();
                 fprintf(stderr, "Maximum number of retransmissions reached.\n");
                 return -1;
@@ -143,8 +143,10 @@ int llOpenRx(LinkLayer llParameters)
     while (1)
     {
         unsigned char packet[5] = {0};
-        int received = llReceive(packet);
 
+        //int received = llReceive(packet);
+        // TODO: implement without llReceive
+        
         if (received == 5 && isValidSupervisionFrame(packet, received, 0x03))
         {
             printf("SET received. Sending UA.\n");
