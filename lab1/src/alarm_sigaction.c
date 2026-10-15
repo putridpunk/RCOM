@@ -4,69 +4,42 @@
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 //              Rui Prior [rcprior@fc.up.pt]
 
+#include "alarm_sigaction.h"
+
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#define FALSE 0
-#define TRUE 1
+static volatile int alarmEnabled = 0;
+static int alarmCount = 0;
 
-int alarmEnabled = FALSE;
-int alarmCount = 0;
-int retransmissions = 0;
-int maxRetransmissions = 3;
-int uaReceived = FALSE;
-
-// Alarm function handler.
-// This function will run whenever the signal SIGALRM is received.
-void alarmHandler(int signal)
-{
-    alarmEnabled = FALSE;
+static void alarmHandler(int sig) {
+    (void)sig;
+    alarmEnabled = 0;
     alarmCount++;
     printf("Alarm #%d received\n", alarmCount);
 }
 
-int main()
-{
-    // Set alarm function handler.
-    // Install the function signal to be automatically invoked when the timer expires,
-    // invoking in its turn the user function alarmHandler
+int setupAlarmHandler(void) {
     struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
+    act.sa_handler = alarmHandler;
+    act.sa_flags = 0; 
     if (sigaction(SIGALRM, &act, NULL) == -1)
-    {
-        perror("sigaction");
-        exit(1);
-    }
-
-    printf("Alarm configured\n");
-
-    while (retransmissions < maxRetransmissions && uaReceived == FALSE)
-    {
-        printf("Sending SET frame\n");
-        alarm(3); // Set alarm to be triggered in 3s
-        alarmEnabled = TRUE;
-
-        // Wait until the alarm triggers or the UA is received.
-        while (alarmEnabled == TRUE && uaReceived == FALSE)
-        {
-            pause();
-        }
-
-        if (uaReceived == TRUE)
-        {
-            alarm(0); // Disable pending alarms
-            alarmEnabled = FALSE;
-            printf("UA received. Alarm disabled.\n");
-            break;
-        }
-
-        retransmissions++;
-        printf("Timeout. Retransmitting SET frame (%d/%d)\n", retransmissions, maxRetransmissions);
-    }
-
-    printf("Ending program\n");
-
+        return -1;
     return 0;
 }
+
+void startAlarm(unsigned seconds) {
+    alarm(seconds);
+    alarmEnabled = 1;
+}
+
+void stopAlarm(void) {
+    alarm(0);
+    alarmEnabled = 0;
+}
+
+void resetAlarmCount(void) { alarmCount = 0; }
+bool isAlarmActive(void) { return alarmEnabled != 0; }
+int  getAlarmCount(void) { return alarmCount; }
