@@ -1,5 +1,3 @@
-// RCOM 2026/2027
-//
 // Main file of the serial port project.
 // DO NOT CHANGE THIS FILE
 
