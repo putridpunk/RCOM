@@ -1,4 +1,4 @@
-// RCOM 2026/2027
+// 
 //
 // Application layer protocol implementation
 // This layer sends or receives the file metadata and payload after
@@ -9,18 +9,27 @@
 #include "serial_port.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// Length field sent ahead of the payload.
+#define SIZE_FIELD_LEN 4
+
+// Largest value the 4-byte length field can carry.
+#define MAX_FILE_SIZE 0xFFFFFFFFL
+
 // Read exactly 'length' bytes from the serial port.
-static int readExactly(unsigned char *buffer, int length)
+// Returns the number of bytes read, or -1 on error.
+static long readExactly(unsigned char *buffer, long length)
 {
-    int total = 0;
+    long total = 0;
 
     while (total < length)
     {
         int bytesRead = readByteSerialPort(buffer + total);
+
         if (bytesRead < 0)
         {
             if (errno == EINTR)
@@ -28,6 +37,9 @@ static int readExactly(unsigned char *buffer, int length)
             perror("readByteSerialPort");
             return -1;
         }
+
+        // VMIN is 1, so a successful read returns one byte; 0 cannot happen
+        // unless the port was closed underneath us.
         if (bytesRead == 0)
             continue;
 
@@ -38,13 +50,18 @@ static int readExactly(unsigned char *buffer, int length)
 }
 
 // Write exactly 'length' bytes to the serial port.
-static int writeExactly(const unsigned char *buffer, int length)
+// Returns the number of bytes written, or -1 on error.
+static long writeExactly(const unsigned char *buffer, long length)
 {
-    int total = 0;
+    long total = 0;
 
     while (total < length)
     {
-        int bytesWritten = writeBytesSerialPort(buffer + total, length - total);
+        long remaining = length - total;
+        int chunk = (remaining > (long)INT_MAX) ? INT_MAX : (int)remaining;
+
+        int bytesWritten = writeBytesSerialPort(buffer + total, chunk);
+
         if (bytesWritten < 0)
         {
             if (errno == EINTR)
@@ -52,8 +69,13 @@ static int writeExactly(const unsigned char *buffer, int length)
             perror("writeBytesSerialPort");
             return -1;
         }
+
         if (bytesWritten == 0)
-            continue;
+        {
+            // A short write that makes no progress would spin forever.
+            fprintf(stderr, "writeBytesSerialPort made no progress.\n");
+            return -1;
+        }
 
         total += bytesWritten;
     }
@@ -72,7 +94,14 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         .nRetransmissions = nTries,
         .timeout = timeout,
     };
-    strcpy(llParameters.serialPort, serialPort);
+
+    int written = snprintf(llParameters.serialPort, sizeof(llParameters.serialPort), "%s", serialPort);
+    if (written < 0 || written >= (int)sizeof(llParameters.serialPort))
+    {
+        fprintf(stderr, "Serial port name too long (max %zu characters).\n",
+                sizeof(llParameters.serialPort) - 1);
+        return;
+    }
 
     if (strcmp(role, "tx") == 0)
     {
@@ -98,23 +127,23 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         }
 
         long fileSize = ftell(file);
-        if (fileSize < 0)
+        if (fileSize < 0 || fileSize > MAX_FILE_SIZE)
         {
-            perror("ftell");
+            fprintf(stderr, "File size out of range (0..%ld bytes).\n", MAX_FILE_SIZE);
             fclose(file);
             llCloseTx();
             return;
         }
         rewind(file);
 
-        unsigned char sizeField[4] = {
+        unsigned char sizeField[SIZE_FIELD_LEN] = {
             (unsigned char)(fileSize & 0xFF),
             (unsigned char)((fileSize >> 8) & 0xFF),
             (unsigned char)((fileSize >> 16) & 0xFF),
             (unsigned char)((fileSize >> 24) & 0xFF)
         };
 
-        if (writeExactly(sizeField, 4) != 4)
+        if (writeExactly(sizeField, SIZE_FIELD_LEN) != SIZE_FIELD_LEN)
         {
             fprintf(stderr, "Failed to send file size.\n");
             fclose(file);
@@ -122,7 +151,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        unsigned char *buffer = malloc((size_t)fileSize == 0 ? 1 : (size_t)fileSize);
+        unsigned char *buffer = malloc(fileSize == 0 ? 1 : (size_t)fileSize);
         if (buffer == NULL)
         {
             fprintf(stderr, "Memory allocation failed.\n");
@@ -141,7 +170,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        if (writeExactly(buffer, (int)bytesRead) != (int)bytesRead)
+        if (writeExactly(buffer, fileSize) != fileSize)
         {
             fprintf(stderr, "Failed to send file data.\n");
             free(buffer);
@@ -152,6 +181,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         free(buffer);
         fclose(file);
+        printf("File %s sent successfully (%ld bytes).\n", filename, fileSize);
         llCloseTx();
     }
     else if (strcmp(role, "rx") == 0)
@@ -159,20 +189,29 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         if (llOpenRx(llParameters) != 0)
             return;
 
-        unsigned char sizeField[4] = {0};
-        if (readExactly(sizeField, 4) != 4)
+        unsigned char sizeField[SIZE_FIELD_LEN] = {0};
+        if (readExactly(sizeField, SIZE_FIELD_LEN) != SIZE_FIELD_LEN)
         {
             fprintf(stderr, "Failed to receive file size.\n");
             llCloseRx();
             return;
         }
 
-        long fileSize = (long)sizeField[0] |
-                        ((long)sizeField[1] << 8) |
-                        ((long)sizeField[2] << 16) |
-                        ((long)sizeField[3] << 24);
+        // Decode through unsigned long: a size with the top bit set would
+        // otherwise become negative on 32-bit long.
+        long fileSize = (long)((unsigned long)sizeField[0] |
+                               ((unsigned long)sizeField[1] << 8) |
+                               ((unsigned long)sizeField[2] << 16) |
+                               ((unsigned long)sizeField[3] << 24));
 
-        unsigned char *buffer = malloc((size_t)fileSize == 0 ? 1 : (size_t)fileSize);
+        if (fileSize < 0 || fileSize > MAX_FILE_SIZE)
+        {
+            fprintf(stderr, "Received file size out of range.\n");
+            llCloseRx();
+            return;
+        }
+
+        unsigned char *buffer = malloc(fileSize == 0 ? 1 : (size_t)fileSize);
         if (buffer == NULL)
         {
             fprintf(stderr, "Memory allocation failed.\n");
@@ -180,7 +219,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        if (fileSize > 0 && readExactly(buffer, (int)fileSize) != fileSize)
+        if (fileSize > 0 && readExactly(buffer, fileSize) != fileSize)
         {
             fprintf(stderr, "Failed to receive file data.\n");
             free(buffer);
@@ -208,7 +247,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         free(buffer);
         fclose(file);
-        printf("File %s received successfully.\n", filename);
+        printf("File %s received successfully (%ld bytes).\n", filename, fileSize);
         llCloseRx();
     }
     else
