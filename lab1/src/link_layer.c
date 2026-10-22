@@ -81,6 +81,14 @@ static int sendSupervisionFrame(unsigned char address, unsigned char control)
     return 0;
 }
 
+// Acknowledge a SET with a UA. Used by llOpenRx, and again if a SET turns up
+// after the connection is open: the transmitter retransmits SET when its UA
+// is lost, and re-acknowledging it is idempotent.
+static int acknowledgeSet(void)
+{
+    return sendSupervisionFrame(A_RX, C_UA);
+}
+
 // Open the serial port as transmitter and perform the SET/UA handshake.
 int llOpenTx(LinkLayer llParameters)
 {
@@ -157,6 +165,8 @@ int llOpenTx(LinkLayer llParameters)
 }
 
 // Open the serial port as receiver and wait for a SET frame from the transmitter.
+// The receiver never times out: the transmitter drives every retry, so waiting
+// indefinitely is what keeps the pair from deadlocking on a late start.
 int llOpenRx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -167,6 +177,17 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
+    // Installed here as well as in llOpenTx: the close handshake arms an alarm
+    // in both roles, and a handler must exist before the first alarm(2) call.
+    if (setupAlarmHandler() == -1)
+    {
+        perror("setupAlarmHandler");
+        closeSerialPort();
+        return -1;
+    }
+
+    stopAlarm();
+    resetAlarmCount();
     linkStatsReset(&linkStats);
 
     for (;;)
@@ -182,19 +203,31 @@ int llOpenRx(LinkLayer llParameters)
             return -1;
         }
 
-        if (received == SUPERVISION_FRAME_SIZE && isValidSupervisionFrame(packet, received, C_SET))
+        // Junk, a frame with a damaged header, a discarded information frame
+        // or an interrupted read: none of these is the peer's fault, so keep
+        // waiting.
+        if (received != SUPERVISION_FRAME_SIZE)
+            continue;
+
+        if (isValidSupervisionFrame(packet, received, C_SET) == FALSE)
         {
-            printf("SET received. Sending UA.\n");
-
-            if (sendSupervisionFrame(A_RX, C_UA) != 0)
-            {
-                perror("writeBytesSerialPort");
-                closeSerialPort();
-                return -1;
-            }
-
-            return 0;
+            // A valid supervision frame that is not a SET, e.g. a DISC from a
+            // transmitter that gave up. Nothing to do but ignore it.
+            printf("Ignoring supervision frame with control 0x%02X while waiting for SET.\n",
+                   (unsigned int)packet[2]);
+            continue;
         }
+
+        printf("SET received. Sending UA.\n");
+
+        if (acknowledgeSet() != 0)
+        {
+            perror("writeBytesSerialPort");
+            closeSerialPort();
+            return -1;
+        }
+
+        return 0;
     }
 }
 
