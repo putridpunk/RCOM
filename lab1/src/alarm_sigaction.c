@@ -1,9 +1,3 @@
-// Alarm example using sigaction.
-// This example shows how to configure an alarm using the sigaction function.
-//
-// Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
-//              Rui Prior [rcprior@fe.up.pt]
-
 #include "alarm_sigaction.h"
 
 #include <signal.h>
