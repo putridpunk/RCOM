@@ -1,5 +1,3 @@
-// RCOM 2026/2027
-//
 // Link layer protocol implementation
 // This module implements the connection establishment and
 // supervision frame handling required by the serial protocol.
@@ -7,59 +5,88 @@
 #include "link_layer.h"
 #include "serial_port.h"
 #include "alarm_sigaction.h"
+#include "frame.h"
 
 #include <errno.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
-#define BUF_SIZE 256
 
-/*int alarmEnabled = FALSE;
-int alarmCount = 0;
+// Counters for the current connection. Filled in as frames are processed;
+// L8 wires them into the close path, which prints them.
+static LinkStats linkStats;
 
-void alarmHandler(int signal)
+// Outcome of one attempt at reading a frame from the serial port.
+typedef enum
 {
-    (void)signal;
-    alarmEnabled = FALSE;
-    alarmCount++;
-    printf("Alarm #%d received\n", alarmCount);
-}*/
+    RX_OK_SUPERVISION, // a complete, valid supervision frame
+    RX_OK_DATA,        // a complete information frame with a valid BCC2
+    RX_IGNORED,        // malformed, truncated or oversized frame; discarded
+    RX_BAD_BCC2,       // information frame whose data field failed its check
+    RX_TIMEOUT,        // the read was interrupted by the alarm
+    RX_IO_ERROR        // unrecoverable error on the serial port
+} RxResult;
+
+// States of the frame reception machine (slides 19-21).
+typedef enum
+{
+    ST_HUNT_FLAG,          // look for the opening delimiter
+    ST_READ_A,             // address field
+    ST_READ_C,             // control field
+    ST_READ_BCC1,          // header check character
+    ST_READ_SUPERVISION_F, // closing flag of a supervision frame
+    ST_READ_DATA           // de-stuffed data field, up to the closing flag
+} RxState;
+
+// The address a frame with the given control field must carry.
+static unsigned char supervisionAddress(unsigned char control)
+{
+    return (control == C_UA) ? A_RX : A_TX;
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
 // Validate a 5-byte supervision frame in the format: F A C BCC1 F.
-// The expected control field depends on whether we are checking for SET (0x03)
-// or UA (0x07). For these frames, BCC1 = A ^ C.
 static int isValidSupervisionFrame(const unsigned char *frame, int frameSize, unsigned char expectedControl)
 {
-    if (frameSize != 5)
+    if (frameSize != SUPERVISION_FRAME_SIZE)
         return FALSE;
 
-    if (frame[0] != 0x7E || frame[4] != 0x7E)
+    if (frame[0] != FRAME_FLAG || frame[4] != FRAME_FLAG)
         return FALSE;
 
-    if (frame[1] != 0x03 || frame[2] != expectedControl)
+    if (frame[1] != supervisionAddress(expectedControl) || frame[2] != expectedControl)
         return FALSE;
 
-    return ((frame[1] ^ frame[2]) == frame[3]);
+    return (frameBcc1(frame[1], frame[2]) == frame[3]);
 }
 
-// Send a supervision frame with the given control byte.
-static int sendSupervisionFrame(unsigned char control)
+// Send a supervision frame. Returns 0 on success, -1 on failure.
+static int sendSupervisionFrame(unsigned char address, unsigned char control)
 {
-    unsigned char frame[5] = {0};
-    frame[0] = 0x7E;
-    frame[1] = 0x03;
-    frame[2] = control;
-    frame[3] = frame[1] ^ frame[2];
-    frame[4] = 0x7E;
+    unsigned char frame[SUPERVISION_FRAME_SIZE];
 
-    return writeBytesSerialPort(frame, 5);
+    int built = frameBuildSupervision(frame, sizeof(frame), address, control);
+    if (built != SUPERVISION_FRAME_SIZE)
+        return -1;
+
+    if (writeBytesSerialPort(frame, built) != built)
+        return -1;
+
+    linkStatsCountSupervisionSent(&linkStats, control);
+    return 0;
+}
+
+// Acknowledge a SET with a UA. Used by llOpenRx, and again if a SET turns up
+// after the connection is open: the transmitter retransmits SET when its UA
+// is lost, and re-acknowledging it is idempotent.
+static int acknowledgeSet(void)
+{
+    return sendSupervisionFrame(A_RX, C_UA);
 }
 
 // Open the serial port as transmitter and perform the SET/UA handshake.
@@ -73,63 +100,73 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    if (setupAlarmHandler() == -1) 
+    if (setupAlarmHandler() == -1)
     {
-        perror("setupAlarmHandler")
+        perror("setupAlarmHandler");
+        closeSerialPort();
         return -1;
     }
 
-    int retries = 0;
-    while (retries <= llParameters.nRetransmissions) 
+    linkStatsReset(&linkStats);
+    resetAlarmCount();
+
+    // nRetransmissions counts retries after the first attempt.
+    const int maxAttempts = llParameters.nRetransmissions + 1;
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
-        unsigned char packet[5] = {0};
+        unsigned char packet[SUPERVISION_FRAME_SIZE] = {0};
 
-        stopAlarm();
-
-        if (sendSupervisionFrame(0x03) < 0) 
+        if (sendSupervisionFrame(A_TX, C_SET) != 0)
         {
             perror("writeBytesSerialPort");
+            stopAlarm();
             closeSerialPort();
             return -1;
         }
 
-        startAlarm(llParameters.timeout);
+        startAlarm((unsigned)llParameters.timeout);
 
-        //int received = llReceive(packet);
-        // ================================
-        // TODO: receive and count received
-        // ================================
-
-        if (received == 5 && isValidSupervisionFrame(packet, received, 0x07))
+        // Block in llReceive until a frame arrives, a fatal I/O error occurs,
+        // or SIGALRM clears the alarm flag. llReceive returns 0 for anything
+        // that is not a supervision frame, so junk and damaged frames are
+        // skipped inside the same attempt instead of burning a retry.
+        for (;;)
         {
-            stopAlarm();
-            printf("UA received. Connection established.\n");
-            return 0;
-        }
+            int received = llReceive(packet);
 
-        if (isAlarmActive() == FALSE)
-        {
-            printf("Timeout waiting for UA. Retransmitting SET.\n");
-            retries++;
-            if (retries > llParameters.nRetransmissions)
+            if (received < 0)
             {
                 stopAlarm();
                 closeSerialPort();
-                fprintf(stderr, "Maximum number of retransmissions reached.\n");
                 return -1;
             }
-            continue;
-        }
 
-        retries++;
+            if (received == SUPERVISION_FRAME_SIZE && isValidSupervisionFrame(packet, received, C_UA))
+            {
+                stopAlarm();
+                printf("UA received. Connection established.\n");
+                return 0;
+            }
+
+            if (isAlarmActive() == FALSE)
+            {
+                linkStats.timeouts++;
+                printf("Timeout waiting for UA. Attempt %d of %d.\n", attempt, maxAttempts);
+                break;
+            }
+        }
     }
 
+    stopAlarm();
     closeSerialPort();
-    fprintf(stderr, "Failed to establish connection.\n");
+    fprintf(stderr, "Maximum number of retransmissions reached. Connection failed.\n");
     return -1;
 }
 
 // Open the serial port as receiver and wait for a SET frame from the transmitter.
+// The receiver never times out: the transmitter drives every retry, so waiting
+// indefinitely is what keeps the pair from deadlocking on a late start.
 int llOpenRx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -140,24 +177,24 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    while (1)
+    // Installed here as well as in llOpenTx: the close handshake arms an alarm
+    // in both roles, and a handler must exist before the first alarm(2) call.
+    if (setupAlarmHandler() == -1)
     {
-        unsigned char packet[5] = {0};
+        perror("setupAlarmHandler");
+        closeSerialPort();
+        return -1;
+    }
 
-        //int received = llReceive(packet);
-        // TODO: implement without llReceive
-        
-        if (received == 5 && isValidSupervisionFrame(packet, received, 0x03))
-        {
-            printf("SET received. Sending UA.\n");
-            if (sendSupervisionFrame(0x07) < 0)
-            {
-                perror("writeBytesSerialPort");
-                closeSerialPort();
-                return -1;
-            }
-            return 0;
-        }
+    stopAlarm();
+    resetAlarmCount();
+    linkStatsReset(&linkStats);
+
+    for (;;)
+    {
+        unsigned char packet[SUPERVISION_FRAME_SIZE] = {0};
+
+        int received = llReceive(packet);
 
         if (received < 0)
         {
@@ -165,6 +202,32 @@ int llOpenRx(LinkLayer llParameters)
             closeSerialPort();
             return -1;
         }
+
+        // Junk, a frame with a damaged header, a discarded information frame
+        // or an interrupted read: none of these is the peer's fault, so keep
+        // waiting.
+        if (received != SUPERVISION_FRAME_SIZE)
+            continue;
+
+        if (isValidSupervisionFrame(packet, received, C_SET) == FALSE)
+        {
+            // A valid supervision frame that is not a SET, e.g. a DISC from a
+            // transmitter that gave up. Nothing to do but ignore it.
+            printf("Ignoring supervision frame with control 0x%02X while waiting for SET.\n",
+                   (unsigned int)packet[2]);
+            continue;
+        }
+
+        printf("SET received. Sending UA.\n");
+
+        if (acknowledgeSet() != 0)
+        {
+            perror("writeBytesSerialPort");
+            closeSerialPort();
+            return -1;
+        }
+
+        return 0;
     }
 }
 
@@ -176,7 +239,7 @@ int llSend(const unsigned char *buf, int bufSize)
 {
     if (buf == NULL || bufSize <= 0)
     {
-        return 0;
+        return -1;
     }
 
     return writeBytesSerialPort(buf, bufSize);
@@ -185,7 +248,197 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 // LLRECEIVE
 ////////////////////////////////////////////////
-// Receive one valid supervision frame from the serial port.
+// Read one frame from the serial port, byte by byte, and classify it.
+//
+// The machine hunts an opening flag, then consumes address, control and BCC1.
+// The control field decides which kind of frame it is: supervision frames end
+// at the next flag, information frames carry a de-stuffed data field followed
+// by a BCC2 before the closing flag.
+//
+// "capacity" is the space available in "buf". A data frame that does not fit
+// is discarded rather than truncated. "*frameSize" receives the number of
+// bytes stored: SUPERVISION_FRAME_SIZE for a supervision frame, the length of
+// the data field for an information frame.
+static RxResult rxReadFrame(unsigned char *buf, size_t capacity, int *frameSize)
+{
+    if (buf == NULL || frameSize == NULL || capacity < (size_t)SUPERVISION_FRAME_SIZE)
+        return RX_IO_ERROR;
+
+    RxState state = ST_HUNT_FLAG;
+
+    unsigned char address = 0;
+    unsigned char control = 0;
+
+    size_t filled = 0;      // de-stuffed bytes held in "buf"
+    int overflow = FALSE;   // the data field did not fit in "buf"
+    int escape = FALSE;     // the previous byte was the escape octet
+
+    for (;;)
+    {
+        unsigned char byte = 0;
+        int r = readByteSerialPort(&byte);
+
+        if (r < 0)
+        {
+            // SIGALRM (or any other signal) interrupts the blocking read; that
+            // is the timeout mechanism, not an error.
+            if (errno == EINTR)
+                return RX_TIMEOUT;
+
+            perror("readByteSerialPort");
+            return RX_IO_ERROR;
+        }
+
+        // The port is configured with VMIN = 1, so a successful read always
+        // returns one byte. A zero means the port went away underneath us.
+        if (r == 0)
+        {
+            fprintf(stderr, "readByteSerialPort returned 0 on a blocking port.\n");
+            return RX_IO_ERROR;
+        }
+
+        switch (state)
+        {
+        case ST_HUNT_FLAG:
+            if (byte == FRAME_FLAG)
+                state = ST_READ_A;
+            break;
+
+        case ST_READ_A:
+            if (byte == FRAME_FLAG)
+            {
+                // One or more flags may precede a frame; stay here.
+                break;
+            }
+
+            if (byte == A_TX || byte == A_RX)
+            {
+                address = byte;
+                state = ST_READ_C;
+            }
+            else
+            {
+                state = ST_HUNT_FLAG;
+            }
+            break;
+
+        case ST_READ_C:
+            if (byte == FRAME_FLAG)
+            {
+                // A flag where the control field should be opens a new frame.
+                state = ST_READ_A;
+                break;
+            }
+
+            control = byte;
+            state = ST_READ_BCC1;
+            break;
+
+        case ST_READ_BCC1:
+            if (byte == FRAME_FLAG)
+            {
+                state = ST_READ_A;
+                break;
+            }
+
+            if (byte != frameBcc1(address, control))
+            {
+                // A frame with a damaged header is dropped without any action
+                // and without consuming a retransmission attempt.
+                linkStats.bcc1Errors++;
+                state = ST_HUNT_FLAG;
+                break;
+            }
+
+            if (frameCIsInfo(control))
+            {
+                filled = 0;
+                overflow = FALSE;
+                escape = FALSE;
+                state = ST_READ_DATA;
+            }
+            else
+            {
+                state = ST_READ_SUPERVISION_F;
+            }
+            break;
+
+        case ST_READ_SUPERVISION_F:
+            if (byte != FRAME_FLAG)
+            {
+                // Malformed supervision frame: resynchronise on the next flag.
+                state = ST_HUNT_FLAG;
+                break;
+            }
+
+            buf[0] = FRAME_FLAG;
+            buf[1] = address;
+            buf[2] = control;
+            buf[3] = frameBcc1(address, control);
+            buf[4] = FRAME_FLAG;
+            *frameSize = SUPERVISION_FRAME_SIZE;
+            return RX_OK_SUPERVISION;
+
+        case ST_READ_DATA:
+            if (escape)
+            {
+                escape = FALSE;
+
+                if (byte == FRAME_ESCAPE_FLAG)
+                    byte = FRAME_FLAG;
+                else if (byte == FRAME_ESCAPE_ESCAPE)
+                    byte = FRAME_ESCAPE;
+                else
+                {
+                    // 0x7D not followed by a valid escape code.
+                    state = ST_HUNT_FLAG;
+                    break;
+                }
+
+                if (filled < capacity)
+                    buf[filled++] = byte;
+                else
+                    overflow = TRUE;
+                break;
+            }
+
+            if (byte == FRAME_ESCAPE)
+            {
+                escape = TRUE;
+                break;
+            }
+
+            if (byte != FRAME_FLAG)
+            {
+                if (filled < capacity)
+                    buf[filled++] = byte;
+                else
+                    overflow = TRUE;
+                break;
+            }
+
+            // Closing flag: the last de-stuffed byte is the BCC2.
+            if (overflow)
+                return RX_IGNORED;
+
+            if (filled < 1)
+                return RX_IGNORED;
+
+            if (frameBcc2(buf, filled - 1) != buf[filled - 1])
+            {
+                linkStats.bcc2Errors++;
+                return RX_BAD_BCC2;
+            }
+
+            *frameSize = (int)(filled - 1);
+            return RX_OK_DATA;
+        }
+    }
+}
+
+// Receive one frame from the serial port.
+// Returns the frame size on success, 0 if the call was interrupted or the
+// frame was discarded, or -1 on a fatal error.
 int llReceive(unsigned char *packet)
 {
     if (packet == NULL)
@@ -193,48 +446,27 @@ int llReceive(unsigned char *packet)
         return -1;
     }
 
-    unsigned char buf[5] = {0};
-    int idx = 0;
+    // L2 callers only ever pass a supervision-frame buffer; information
+    // frames are therefore discarded by the capacity check rather than
+    // overflowing it. L6 gives llReceive the MAX_PAYLOAD_SIZE contract.
+    int frameSize = 0;
+    RxResult result = rxReadFrame(packet, SUPERVISION_FRAME_SIZE, &frameSize);
 
-    while (1)
+    switch (result)
     {
-        unsigned char byte = 0;
-        int r = readByteSerialPort(&byte);
+    case RX_OK_SUPERVISION:
+        linkStatsCountSupervisionReceived(&linkStats, packet[2]);
+        return frameSize;
 
-        if (r < 0)
-        {
-            if (errno == EINTR)
-            {
-                return -1;
-            }
-            perror("readByteSerialPort");
-            return -1;
-        }
+    case RX_OK_DATA:
+    case RX_BAD_BCC2:
+    case RX_IGNORED:
+    case RX_TIMEOUT:
+        return 0;
 
-        if (r == 0)
-        {
-            continue;
-        }
-
-        if (idx == 0 && byte != 0x7E)
-        {
-            continue;
-        }
-
-        buf[idx++] = byte;
-
-        if (idx == 5)
-        {
-            if (buf[0] == 0x7E && buf[4] == 0x7E && buf[1] == 0x03 &&
-                ((buf[1] ^ buf[2]) == buf[3]))
-            {
-                for (int i = 0; i < 5; i++)
-                    packet[i] = buf[i];
-                return 5;
-            }
-
-            idx = 0;
-        }
+    case RX_IO_ERROR:
+    default:
+        return -1;
     }
 }
 
@@ -242,8 +474,10 @@ int llReceive(unsigned char *packet)
 // LLCLOSE
 ////////////////////////////////////////////////
 // Close the transmitter port after the communication is complete.
-int llCloseTx()
+int llCloseTx(void)
 {
+    stopAlarm();
+
     if (closeSerialPort() < 0)
     {
         perror("closeSerialPort");
@@ -255,7 +489,7 @@ int llCloseTx()
 }
 
 // Close the receiver port after the communication is complete.
-int llCloseRx()
+int llCloseRx(void)
 {
     if (closeSerialPort() < 0)
     {
