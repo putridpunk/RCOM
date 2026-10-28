@@ -2,6 +2,7 @@
 
 #include <signal.h>
 #include <string.h>
+#include <unistd.h> // alarm(2)
 
 // Both flags are written by the handler and read by the protocol code, so they
 // must be sig_atomic_t. The handler only touches these: write(2) and alarm(2)
