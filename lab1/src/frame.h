@@ -1,7 +1,7 @@
 // Serial data link protocol: frame primitives.
 //
 // Pure helpers shared by the link layer: protocol constants, the two block
-// check characters, byte stuffing and the supervision frame builder, plus the
+// check characters, byte stuffing and the frame builders, plus the
 // transmission statistics records printed when a connection is closed.
 //
 // Nothing in this module touches the serial port, waits on a signal or keeps
@@ -29,9 +29,17 @@
 // Address field (A)
 ////////////////////////////////////////////////
 
-// Frames sent by the transmitter, and replies sent by the receiver.
+// A command carries the address of the side that sends it; a reply carries the
+// address of the command it answers. Concretely:
+//
+//   Tx -> Rx : I, SET, DISC .................... A = 0x03
+//   Rx -> Tx : UA (answers SET), RR, REJ ....... A = 0x03
+//   Rx -> Tx : DISC (answers the Tx DISC) ...... A = 0x01
+//   Tx -> Rx : UA (answers the Rx DISC) ........ A = 0x01
+//
+// Note that the closing handshake therefore crosses over: both ends use 0x01
+// for the last two frames. Do not derive A from "control == C_UA".
 #define A_TX 0x03
-// Frames sent by the receiver, and replies sent by the transmitter.
 #define A_RX 0x01
 
 ////////////////////////////////////////////////
@@ -41,9 +49,22 @@
 #define C_SET 0x03  // connection request
 #define C_DISC 0x0B // disconnection request
 #define C_UA 0x07   // unnumbered acknowledgement
-#define C_RR(ns) ((unsigned char)(0x05 | ((ns) ? 0x80 : 0x00)))  // receive ready
-#define C_REJ(ns) ((unsigned char)(0x01 | ((ns) ? 0x80 : 0x00))) // reject
-#define C_I(ns) ((unsigned char)((ns) ? 0x40 : 0x00))            // information
+
+#define C_I0 0x00   // information frame, Ns = 0
+#define C_I1 0x80   // information frame, Ns = 1
+
+#define C_RR0 0xAA  // receive ready, Nr = 0 (next expected frame is I0)
+#define C_RR1 0xAB  // receive ready, Nr = 1 (next expected frame is I1)
+
+#define C_REJ0 0x54 // reject, Nr = 0
+#define C_REJ1 0x55 // reject, Nr = 1
+
+// Ns lives in bit 7 of an information frame; Nr lives in bit 0 of RR and REJ.
+// The two encodings are unrelated, so the builders and the extractors below
+// must never share bit arithmetic.
+#define C_I(ns) ((unsigned char)((ns) ? C_I1 : C_I0))
+#define C_RR(ns) ((unsigned char)((ns) ? C_RR1 : C_RR0))
+#define C_REJ(ns) ((unsigned char)((ns) ? C_REJ1 : C_REJ0))
 
 ////////////////////////////////////////////////
 // Frame geometry
@@ -70,20 +91,21 @@
 // Control field predicates
 ////////////////////////////////////////////////
 
-// True for an information frame (Ns in bit 6). Supervision and reply frames
-// all have bit 0 set, so bit 0 alone separates the two classes.
+// True for an information frame. Equality against the two legal control
+// values: bit tests are wrong here, because RR0 (0xAA) has bit 0 clear and
+// would otherwise be mistaken for a data frame.
 bool frameCIsInfo(unsigned char control);
 
-// True for a RR reply, whatever the value of Nr.
+// True for an RR reply, whatever the value of Nr.
 bool frameCIsRR(unsigned char control);
 
 // True for a REJ reply, whatever the value of Nr.
 bool frameCIsREJ(unsigned char control);
 
-// Ns carried by an information frame control field.
+// Ns carried by an information frame control field (bit 7).
 bool frameCGetNs(unsigned char control);
 
-// Nr carried by a RR or REJ control field.
+// Nr carried by a RR or REJ control field (bit 0, not bit 7).
 bool frameCGetNr(unsigned char control);
 
 ////////////////////////////////////////////////
@@ -105,7 +127,7 @@ unsigned char frameBcc2(const unsigned char *data, size_t dataSize);
 // 0x7D with 0x7D 0x5D.
 //
 // Returns the number of bytes written to "out", or -1 if the result does not
-// fit in outCapacity (nothing is ever written past the capacity), or if the
+// fit in outCapacity (nothing is written at all in that case), or if the
 // arguments are inconsistent.
 int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_t outCapacity);
 
@@ -117,6 +139,13 @@ int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_
 // Returns SUPERVISION_FRAME_SIZE, or -1 if outCapacity is too small.
 int frameBuildSupervision(unsigned char *out, size_t outCapacity,
                           unsigned char address, unsigned char control);
+
+// Build the information frame F A C BCC1 <stuffed packet || stuffed BCC2> F.
+// Ns selects 0x00 or 0x80. packet may be NULL only with packetLen == 0.
+// Returns the number of wire bytes written, or -1 on error / small buffer.
+int frameBuildInfo(unsigned char *out, size_t outCapacity,
+                   unsigned char address, unsigned char ns,
+                   const unsigned char *packet, size_t packetLen);
 
 ////////////////////////////////////////////////
 // Transmission statistics
@@ -141,7 +170,7 @@ typedef struct
     unsigned long supervisionSent;
     unsigned long supervisionReceived;
 
-    // Information frames
+    // Information frames transmitted / delivered to the application
     unsigned long infoSent;
     unsigned long infoReceived;
 
@@ -151,8 +180,11 @@ typedef struct
     unsigned long bcc1Errors;
     unsigned long bcc2Errors;
     unsigned long duplicateFrames;
+    unsigned long addressErrors;
 
-    // Useful payload actually carried by information frames
+    // Useful payload carried by information frames. Counted once per packet
+    // queued for transmission, not once per retry, so payloadBytesSent equals
+    // the number of file bytes handed to the link layer.
     unsigned long payloadBytesSent;
     unsigned long payloadBytesReceived;
 
