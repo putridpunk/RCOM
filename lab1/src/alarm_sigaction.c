@@ -4,17 +4,15 @@
 #include <string.h>
 #include <unistd.h> // alarm(2)
 
-// Both flags are written by the handler and read by the protocol code, so they
-// must be sig_atomic_t. The handler only touches these: write(2) and alarm(2)
-// are async-signal-safe, printf(3) is not.
+// Written by the handler and read by the protocol code, so it must be
+// sig_atomic_t. The handler touches nothing else: printf(3) is not
+// async-signal-safe.
 static volatile sig_atomic_t alarmEnabled = 0;
-static volatile sig_atomic_t alarmCount = 0;
 
 static void alarmHandler(int sig)
 {
     (void)sig;
     alarmEnabled = 0;
-    alarmCount++;
 }
 
 int setupAlarmHandler(void)
@@ -47,8 +45,4 @@ void stopAlarm(void)
     alarmEnabled = 0;
 }
 
-void resetAlarmCount(void) { alarmCount = 0; }
-
 bool isAlarmActive(void) { return alarmEnabled != 0; }
-
-int getAlarmCount(void) { return (int)alarmCount; }

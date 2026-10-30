@@ -1,35 +1,14 @@
 // Serial data link protocol: frame primitives (implementation).
 //
-// Everything here is pure: no serial port, no signals, no mutable state.
-// The only side effect is the printf done by linkStatsPrint.
+// Everything here is pure: no serial port, no signals, no mutable state and no
+// output. The only effects are the bytes written to the caller's buffer.
 
 #include "frame.h"
 
-#include <stdio.h>
-#include <string.h>
+#include <stddef.h>
 
 ////////////////////////////////////////////////
-// Internal helpers
-////////////////////////////////////////////////
-
-static int isSpecial(unsigned char byte)
-{
-    return byte == FRAME_FLAG || byte == FRAME_ESCAPE;
-}
-
-// Number of bytes "in" occupies once stuffed.
-static size_t stuffedSize(const unsigned char *in, size_t inSize)
-{
-    size_t total = 0;
-
-    for (size_t i = 0; i < inSize; i++)
-        total += isSpecial(in[i]) ? 2u : 1u;
-
-    return total;
-}
-
-////////////////////////////////////////////////
-// Control field predicates
+// Control field predicates and extractors
 ////////////////////////////////////////////////
 
 bool frameCIsInfo(unsigned char control)
@@ -47,16 +26,43 @@ bool frameCIsREJ(unsigned char control)
     return control == C_REJ0 || control == C_REJ1;
 }
 
-bool frameCGetNs(unsigned char control)
+unsigned char frameCGetNs(unsigned char control)
 {
-    return (control & 0x80) != 0;
+    return (unsigned char)((control & 0x80) ? 1u : 0u);
 }
 
-bool frameCGetNr(unsigned char control)
+unsigned char frameCGetNr(unsigned char control)
 {
     // 0xAA/0xAB and 0x54/0x55 differ in bit 0 only. Bit 7 is always set for
     // RR and clear for REJ, so using it here would return a constant.
-    return (control & 0x01) != 0;
+    return (unsigned char)(control & 0x01);
+}
+
+const char *frameControlName(unsigned char control)
+{
+    switch (control)
+    {
+    case C_SET:
+        return "SET";
+    case C_DISC:
+        return "DISC";
+    case C_UA:
+        return "UA";
+    case C_I0:
+        return "I0";
+    case C_I1:
+        return "I1";
+    case C_RR0:
+        return "RR0";
+    case C_RR1:
+        return "RR1";
+    case C_REJ0:
+        return "REJ0";
+    case C_REJ1:
+        return "REJ1";
+    default:
+        return "unknown";
+    }
 }
 
 ////////////////////////////////////////////////
@@ -98,9 +104,14 @@ int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_
     if (inSize == 0)
         return 0;
 
-    // Capacity is checked before a single byte is written, so a failure never
-    // leaves a half-stuffed buffer behind.
-    if (stuffedSize(in, inSize) > outCapacity)
+    // The exact size is checked before a single byte is written, so a failure
+    // never leaves a half-stuffed buffer behind.
+    size_t needed = 0;
+
+    for (size_t i = 0; i < inSize; i++)
+        needed += (in[i] == FRAME_FLAG || in[i] == FRAME_ESCAPE) ? 2u : 1u;
+
+    if (needed > outCapacity)
         return -1;
 
     for (size_t i = 0; i < inSize; i++)
@@ -136,8 +147,9 @@ int frameBuildSupervision(unsigned char *out, size_t outCapacity,
     if (out == NULL || outCapacity < SUPERVISION_FRAME_SIZE)
         return -1;
 
-    // For every control value in use the BCC1 result is never 0x7E or 0x7D,
-    // so the header of a supervision frame never needs stuffing.
+    // For every control value in use the BCC1 result is never 0x7E or 0x7D
+    // (tests/selftest.c asserts it over the whole A x C table), so the header
+    // of a supervision frame never needs stuffing.
     out[0] = FRAME_FLAG;
     out[1] = address;
     out[2] = control;
@@ -151,13 +163,6 @@ int frameBuildInfo(unsigned char *out, size_t outCapacity,
                    unsigned char address, unsigned char ns,
                    const unsigned char *packet, size_t packetLen)
 {
-    unsigned char control;
-    unsigned char bcc1;
-    unsigned char bcc2;
-    size_t needed;
-    size_t written;
-    int stuffed;
-
     if (out == NULL)
         return -1;
 
@@ -167,165 +172,25 @@ int frameBuildInfo(unsigned char *out, size_t outCapacity,
     if (packetLen > MAX_PAYLOAD_SIZE)
         return -1;
 
-    control = C_I(ns);
-    bcc1 = frameBcc1(address, control);
-
-    // Both checksums are computed on the un-stuffed bytes.
-    bcc2 = frameBcc2(packet, packetLen);
-
-    needed = FRAME_HEADER_SIZE + stuffedSize(packet, packetLen) +
-             stuffedSize(&bcc2, 1) + 1;
-
-    if (needed > outCapacity)
+    // Checked once, and only once: with MAX_FRAME_SIZE available the stuffing
+    // calls below cannot fail, so "out" is written whole or not at all.
+    if (outCapacity < MAX_FRAME_SIZE)
         return -1;
 
-    written = 0;
+    unsigned char control = C_I(ns);
+    unsigned char bcc2 = frameBcc2(packet, packetLen);
+    size_t written = 0;
+
     out[written++] = FRAME_FLAG;
     out[written++] = address;
     out[written++] = control;
-    out[written++] = bcc1;
+    out[written++] = frameBcc1(address, control);
 
-    stuffed = frameStuff(packet, packetLen, out + written, outCapacity - written);
-    if (stuffed < 0)
-        return -1;
-    written += (size_t)stuffed;
-
-    stuffed = frameStuff(&bcc2, 1, out + written, outCapacity - written);
-    if (stuffed < 0)
-        return -1;
-    written += (size_t)stuffed;
+    // Both checksums were computed on the un-stuffed bytes.
+    written += (size_t)frameStuff(packet, packetLen, out + written, outCapacity - written);
+    written += (size_t)frameStuff(&bcc2, 1, out + written, outCapacity - written);
 
     out[written++] = FRAME_FLAG;
 
     return (int)written;
-}
-
-////////////////////////////////////////////////
-// Transmission statistics
-////////////////////////////////////////////////
-
-void linkStatsReset(LinkStats *stats)
-{
-    if (stats == NULL)
-        return;
-
-    memset(stats, 0, sizeof(*stats));
-
-    if (clock_gettime(CLOCK_MONOTONIC, &stats->startTime) == 0)
-        stats->started = true;
-    else
-        stats->started = false;
-}
-
-void linkStatsCountSupervisionSent(LinkStats *stats, unsigned char control)
-{
-    if (stats == NULL)
-        return;
-
-    stats->supervisionSent++;
-
-    switch (control)
-    {
-    case C_SET:
-        stats->setSent++;
-        break;
-    case C_UA:
-        stats->uaSent++;
-        break;
-    case C_DISC:
-        stats->discSent++;
-        break;
-    case C_RR0:
-    case C_RR1:
-        stats->rrSent++;
-        break;
-    case C_REJ0:
-    case C_REJ1:
-        stats->rejSent++;
-        break;
-    default:
-        break;
-    }
-}
-
-void linkStatsCountSupervisionReceived(LinkStats *stats, unsigned char control)
-{
-    if (stats == NULL)
-        return;
-
-    stats->supervisionReceived++;
-
-    switch (control)
-    {
-    case C_SET:
-        stats->setReceived++;
-        break;
-    case C_UA:
-        stats->uaReceived++;
-        break;
-    case C_DISC:
-        stats->discReceived++;
-        break;
-    case C_RR0:
-    case C_RR1:
-        stats->rrReceived++;
-        break;
-    case C_REJ0:
-    case C_REJ1:
-        stats->rejReceived++;
-        break;
-    default:
-        break;
-    }
-}
-
-double linkStatsElapsedSeconds(const LinkStats *stats)
-{
-    struct timespec now;
-
-    if (stats == NULL || stats->started == false)
-        return 0.0;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0.0;
-
-    return (double)(now.tv_sec - stats->startTime.tv_sec) +
-           (double)(now.tv_nsec - stats->startTime.tv_nsec) / 1.0e9;
-}
-
-void linkStatsPrint(const LinkStats *stats)
-{
-    double elapsed;
-    double totalPayload;
-
-    if (stats == NULL)
-        return;
-
-    elapsed = linkStatsElapsedSeconds(stats);
-    totalPayload = (double)stats->payloadBytesSent + (double)stats->payloadBytesReceived;
-
-    printf("\n--- Link layer statistics ---\n");
-    printf("  elapsed ................ %8.3f s\n", elapsed);
-
-    printf("  SET   sent/received .... %8lu / %lu\n", stats->setSent, stats->setReceived);
-    printf("  UA    sent/received .... %8lu / %lu\n", stats->uaSent, stats->uaReceived);
-    printf("  DISC  sent/received .... %8lu / %lu\n", stats->discSent, stats->discReceived);
-    printf("  RR    sent/received .... %8lu / %lu\n", stats->rrSent, stats->rrReceived);
-    printf("  REJ   sent/received .... %8lu / %lu\n", stats->rejSent, stats->rejReceived);
-
-    printf("  I     sent/received .... %8lu / %lu\n", stats->infoSent, stats->infoReceived);
-    printf("  payload sent/received .. %8lu / %lu bytes\n",
-           stats->payloadBytesSent, stats->payloadBytesReceived);
-
-    printf("  retransmissions ........ %8lu\n", stats->retransmissions);
-    printf("  timeouts ............... %8lu\n", stats->timeouts);
-    printf("  BCC1 errors ............ %8lu\n", stats->bcc1Errors);
-    printf("  BCC2 errors ............ %8lu\n", stats->bcc2Errors);
-    printf("  duplicate frames ....... %8lu\n", stats->duplicateFrames);
-    printf("  wrong address/class .... %8lu\n", stats->addressErrors);
-
-    if (elapsed > 0.0)
-        printf("  throughput ............. %8.1f B/s\n", totalPayload / elapsed);
-
-    printf("-----------------------------\n");
 }
