@@ -271,11 +271,18 @@ static void applicationTx(const LinkLayer *params, const char *filename)
     bool ok = (sendPacket(startPacket, startLen) == 0);
 
     unsigned char chunk[APP_DATA_CHUNK];
+    unsigned char dataPacket[MAX_PAYLOAD_SIZE];
     size_t readBytes;
 
     while (ok && (readBytes = fread(chunk, 1, sizeof(chunk), file)) > 0)
-        ok = (sendPacket(chunk, readBytes) == 0);
-
+    {
+        // DATA needs the same C|L2|L1 header START and END get, build it here
+        // and hand the whole packet down. 3 + 997 is exactly MAX_PAYLOAD_SIZE
+        size_t dataLen = buildPacket(dataPacket, sizeof(dataPacket),
+                                     APP_C_DATA, chunk, readBytes);
+        ok = (dataLen > 0) && (sendPacket(dataPacket, dataLen) == 0);
+    }
+    
     if (ok && ferror(file))
     {
         fprintf(stderr, "Read error on %s.\n", filename);
