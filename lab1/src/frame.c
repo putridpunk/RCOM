@@ -24,7 +24,8 @@ unsigned char frameCGetNs(unsigned char control)
 
 unsigned char frameCGetNr(unsigned char control)
 {
-    // bit 0: bit 7 is constant within RR and within REJ
+    // Bit 0, and only bit 0: bit 7 is constant within RR and constant (the
+    // other way) within REJ, so testing it here would return a constant.
     return (unsigned char)(control & 0x01);
 }
 
@@ -160,6 +161,9 @@ int frameBuildInfo(unsigned char *out, size_t outCapacity,
     out[written++] = control;
     out[written++] = frameBcc1(address, control);
 
+    // BCC2 was computed over the raw packet, before either stuffing call: the
+    // receiver computes its check after de-stuffing, so the two agree only if
+    // the escape mechanism is applied strictly after the checksum.
     written += (size_t)frameStuff(packet, packetLen, out + written, outCapacity - written);
     written += (size_t)frameStuff(&bcc2, 1, out + written, outCapacity - written);
 

@@ -4,7 +4,10 @@
 #include <string.h>
 #include <unistd.h> // alarm(2)
 
-// written by the handler, so sig_atomic_t; nothing else is safe in there
+// Written by the handler, read by the protocol code, so it must be
+// sig_atomic_t. The handler does nothing else: write(2) and alarm(2) are
+// async-signal-safe, printf(3) is not, which is why every message about a
+// timeout is printed by the code that observes the cleared flag.
 static volatile sig_atomic_t alarmEnabled = 0;
 
 static void alarmHandler(int sig)
