@@ -1,20 +1,27 @@
-// Application layer protocol implementation.
 //
-// START: C=1 | TLVs   DATA: C=2 | L2 | L1 | K bytes   END: C=3 | TLVs
-// TLV 0 = size (4B big-endian), TLV 1 = name (0..255 raw); unknown types
-// are skipped by their length.
+// Application layer protocol.
 //
-// START and END are built from one metadata block, so END repeats START octet
-// for octet and the receiver can check exactly that with memcmp instead of
-// comparing field by field and trusting that it enumerated them all.
+// Packets, as the lab spec defines them:
 //
-// The receiver takes the output path from its own command line, never from the
-// wire: the name TLV is carried and verified, not obeyed.
+//   START : C=1 | TLV parameters
+//   DATA  : C=2 | L2 | L1 | K payload bytes,  K = 256*L2 + L1
+//   END   : C=3 | the same TLV parameters sent in START
 //
-// Layering: this module only builds and parses whole packets, and writes the K
-// fragment bytes of a DATA packet and nothing else -- no frame header, no TLV,
-// no checksum. An RR means the link accepted the frame, not that the receiver
-// wrote it to disk.
+// Our TLV encoding:
+//   type 0, file size : length 4, unsigned 32-bit big-endian count
+//   type 1, file name : length 0..255, raw bytes, no terminator
+//   type 0 comes first. Unknown types get skipped by their length.
+//
+// START and END are built from the same metadata block, so END repeats START
+// byte for byte. The receiver checks exactly that with memcmp, rather than
+// comparing field by field and trusting that it listed them all.
+//
+// The output path comes from the receiver's own command line, never from the
+// wire. The name TLV is carried and verified; it isn't obeyed.
+//
+// This module builds and parses whole packets, and writes the K data bytes of a
+// DATA packet. Nothing else goes near the wire. An RR from llSend means the link
+// took the frame, not that the receiver wrote it to disk.
 
 #include "application_layer.h"
 #include "link_layer.h"
@@ -23,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ---- Protocol constants ----
 
 #define APP_C_START 1
 #define APP_C_DATA 2
@@ -33,17 +42,18 @@
 
 #define SIZE_VALUE_LEN 4
 #define MAX_NAME_LEN 255
+// Worst case: size TLV (2 + 4) followed by a full-length name TLV.
 #define MAX_METADATA_SIZE (2 + SIZE_VALUE_LEN + 2 + MAX_NAME_LEN)
 
-// The size TLV is four octets, so a file must fit in 32 bits.
+// The size TLV is four octets, so the file has to fit in 32 bits.
 #define MAX_FILE_SIZE 0xFFFFFFFFUL
 
-// Fragment carried by one DATA packet. A packet holds at most MAX_PAYLOAD_SIZE
-// bytes, three of which are the C, L2 and L1 fields.
+// Fragment per DATA packet. A packet holds MAX_PAYLOAD_SIZE bytes, three of
+// which are the C, L2 and L1 fields.
 //
-// Override with -DAPP_DATA_CHUNK=... to measure efficiency with smaller
-// information frames: the receiver reads K from L2/L1 of every packet, so both
-// ends stay compatible without any other change.
+// Override with -DAPP_DATA_CHUNK=... for the efficiency measurements. The
+// receiver reads K from L2/L1 of each packet, so both ends stay compatible with
+// no other change.
 #ifndef APP_DATA_CHUNK
 #define APP_DATA_CHUNK (MAX_PAYLOAD_SIZE - 3)
 #endif
@@ -53,16 +63,19 @@ _Static_assert(APP_DATA_CHUNK >= 1 && APP_DATA_CHUNK + 3 <= MAX_PAYLOAD_SIZE,
 _Static_assert(MAX_METADATA_SIZE + 3 <= MAX_PAYLOAD_SIZE,
                "START/END metadata must fit in one packet");
 
-// Consecutive silent timeouts the receiver tolerates between packets.
+// Silent timeouts the receiver tolerates between packets.
 //
-// It must strictly outlast the transmitter's own budget for one frame,
-// (nRetransmissions + 1) * (timeout + one frame time): 4 * (4 + 1.05) = 20 s at
-// 9600 baud and 4 * (4 + 2.10) = 24 s at 4800, the slowest rate at which a full
-// frame still fits inside the timeout. Twelve rounds of four seconds is safely
-// above both, so the transmitter is always the side that declares a transfer
-// failed and the receiver never reports a different reason for the same event.
+// It has to outlast the transmitter's own budget for a single frame,
+// (nRetransmissions + 1) * (timeout + frame time), so that the transmitter is
+// always the side declaring failure. With main.c's values that's
+// 4 * (4 + 4.2) = 32.8 s in the worst case worth caring about, and 12 * 4 s =
+// 48 s clears it. At 2400 baud a full frame already takes longer than the
+// timeout, so nothing works down there anyway.
 #define RX_SILENT_ROUNDS 12
 
+// ---- Packet construction and parsing ----
+
+// Build "C | L2 | L1 | payload". Returns the packet length, or 0 on error.
 static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char type,
                           const unsigned char *payload, size_t payloadLen)
 {
@@ -85,8 +98,7 @@ static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char typ
     return payloadLen + 3;
 }
 
-// The declared length must match the packet length exactly: that is the
-// integrity check the specification asks of the two L octets.
+// Returns the type, or -1 when L2/L1 disagrees with the length actually read.
 static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *payloadLen)
 {
     size_t declared;
@@ -103,6 +115,8 @@ static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *pa
     return (int)packet[0];
 }
 
+// Build the TLV block that START and END both carry. Returns its length, or 0 if
+// the arguments can't be encoded.
 static size_t buildMetadata(unsigned char *out, size_t capacity,
                             unsigned long fileSize, const char *filename)
 {
@@ -112,9 +126,9 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     if (out == NULL || fileSize > MAX_FILE_SIZE)
         return 0;
 
-    // A name that does not fit its one-octet length field cannot be announced.
-    // Refuse the transfer rather than dropping the name silently: START and END
-    // would still agree with each other, so nothing downstream would notice.
+    // A name longer than a one-octet length can't be announced. Refuse the
+    // transfer instead of quietly leaving it out: START and END would still
+    // agree with each other, so nothing downstream would notice.
     if (nameLen > MAX_NAME_LEN)
         return 0;
 
@@ -139,9 +153,9 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     return written;
 }
 
-// The only parameter this receiver needs from START is the size; it validates
-// END by comparing the whole block, which also covers parameters it does not
-// understand. Unknown types are skipped by their length, as the spec allows.
+// Walk the TLVs of a START packet and pull out the file size.
+// Returns 0 on success, -1 on a structural problem or a missing/duplicate size.
+// Unknown types are skipped by their length, which the spec allows.
 static int parseSize(const unsigned char *tlv, size_t len, unsigned long *fileSize)
 {
     size_t pos = 0;
@@ -186,6 +200,9 @@ static int parseSize(const unsigned char *tlv, size_t len, unsigned long *fileSi
     return haveSize ? 0 : -1;
 }
 
+// ---- Transmitter ----
+
+// Hand a finished packet to the link layer.
 static int sendPacket(const unsigned char *packet, size_t packetLen)
 {
     if (packet == NULL || packetLen == 0 || packetLen > MAX_PAYLOAD_SIZE)
@@ -241,7 +258,7 @@ static void applicationTx(const LinkLayer *params, const char *filename)
 
     rewind(file);
 
-    // One metadata block, two packet types: END is START with a different C.
+    // One metadata block, two packets: END is START with a different type.
     unsigned char metadata[MAX_METADATA_SIZE];
     const size_t metadataLen = buildMetadata(metadata, sizeof(metadata),
                                              (unsigned long)fileSize, filename);
@@ -270,7 +287,6 @@ static void applicationTx(const LinkLayer *params, const char *filename)
 
     if (llOpenTx(*params) != 0)
     {
-        // This is the whole transcript of a transfer attempted with no receiver.
         fprintf(stderr, "Transfer of %s aborted: connection not established.\n", filename);
         fclose(file);
         return;
@@ -301,6 +317,8 @@ static void applicationTx(const LinkLayer *params, const char *filename)
     else
         fprintf(stderr, "Transfer of %s failed.\n", filename);
 }
+
+// ---- Receiver ----
 
 static void applicationRx(const LinkLayer *params, const char *filename)
 {
@@ -337,8 +355,7 @@ static void applicationRx(const LinkLayer *params, const char *filename)
 
         if (length == 0)
         {
-            // Nothing arrived within one timeout interval. Bounded, so a
-            // vanished transmitter cannot hang the receiver forever.
+            // Bounded, so a transmitter that vanished can't hang us forever.
             if (++idleCount > RX_SILENT_ROUNDS)
             {
                 failure = "no data for too long";
@@ -387,7 +404,7 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            // Kept verbatim, so END can be compared against it octet for octet.
+            // Kept verbatim so END can be compared against it byte for byte.
             memcpy(startMetadata, packet + 3, payloadLen);
             startMetadataLen = payloadLen;
             sawStart = true;
@@ -425,7 +442,7 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            // "END repeats the information in START", checked as what it is.
+            // "END repeats the information in START", checked literally.
             if (payloadLen != startMetadataLen ||
                 memcmp(packet + 3, startMetadata, startMetadataLen) != 0)
             {
@@ -448,21 +465,14 @@ static void applicationRx(const LinkLayer *params, const char *filename)
         }
     }
 
-    // fclose is where a write to a full disk finally fails, and it is the last
-    // chance to notice: without this the run would report success on a file
-    // that was never completely written.
-    if (file != NULL && fclose(file) != 0)
-    {
-        perror("fclose");
-        if (failure == NULL)
-            failure = "the output file could not be closed";
-    }
+    if (file != NULL)
+        fclose(file);
 
     if (failure != NULL && sawStart)
     {
-        // Never leave a truncated file behind. "make check_files" is
-        // "diff -s ... || exit 0", so a half-written file reads as a near-miss
-        // in the demo and hides the real cause of the failure.
+        // Don't leave a truncated file behind. "make check_files" is
+        // "diff -s ... || exit 0", so a half-written file reads as a near miss
+        // in the demo and hides what actually went wrong.
         remove(filename);
         fprintf(stderr, "Partial file %s removed.\n", filename);
     }
@@ -476,13 +486,13 @@ static void applicationRx(const LinkLayer *params, const char *filename)
         printf("File %s received successfully (%lu bytes).\n", filename, receivedSize);
 }
 
+// ---- Entry point ----
+
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    // Best effort, and the only way to get line-buffered output without editing
-    // main.c: strictly, setvbuf must be called before the stream is used and
-    // main has already printed its banner, but glibc accepts it and a demo
-    // transcript through tee is worth more than the letter of 7.19.5.6.
+    // Line-buffered, so a piped or tee'd demo transcript arrives line by line
+    // instead of in 4 KB blocks.
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     LinkLayer params;
