@@ -4,10 +4,8 @@
 #include <string.h>
 #include <unistd.h> // alarm(2)
 
-// Written by the handler, read by the protocol code, so it must be
-// sig_atomic_t. The handler does nothing else: write(2) and alarm(2) are
-// async-signal-safe, printf(3) is not, which is why every message about a
-// timeout is printed by the code that observes the cleared flag.
+// The handler writes it and the protocol reads it, so sig_atomic_t. Nothing
+// else is shared with the handler: printf(3) isn't async-signal-safe.
 static volatile sig_atomic_t alarmEnabled = 0;
 
 static void alarmHandler(int sig)
@@ -23,7 +21,8 @@ int setupAlarmHandler(void)
     memset(&act, 0, sizeof(act));
     act.sa_handler = alarmHandler;
     sigemptyset(&act.sa_mask);
-    // SA_RESTART deliberately unset: the blocking read() must return EINTR
+    // No SA_RESTART on purpose. The blocking read() has to come back with
+    // EINTR, or the protocol never notices the timeout.
     act.sa_flags = 0;
 
     if (sigaction(SIGALRM, &act, NULL) == -1)
@@ -34,7 +33,6 @@ int setupAlarmHandler(void)
 
 void startAlarm(unsigned seconds)
 {
-    // flag first, so the handler always finds it set
     alarmEnabled = 1;
     alarm(seconds);
 }
