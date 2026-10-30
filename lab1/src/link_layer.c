@@ -4,11 +4,25 @@
 //   supervision : F | A | C | BCC1 | F
 //   information : F | A | C | BCC1 | application packet | BCC2 | F
 //
-// Only the transmitter sends information frames. The transfer is
-// Stop-and-Wait with alternating Ns (0/1); an RR or REJ carries Nr, the next
-// information frame the receiver expects. Ns advances only when an RR with
-// Nr == !Ns arrives, so every retry repeats the same number and the same
+// Only the transmitter sends information frames. The transfer is Stop-and-Wait
+// with alternating Ns (0/1); an RR or REJ carries Nr, the next information
+// frame the receiver expects. Ns advances only when an RR whose Nr is not the
+// current Ns arrives, so every retry repeats the same number and the same
 // packet bytes.
+//
+// Every supervision exchange in the protocol has the same shape: send a frame,
+// arm the alarm, wait for the reply that answers it, repeat a bounded number of
+// times. That shape is implemented once, in sendAndWait() and waitAck(), and
+// every other function here is a few lines around it.
+//
+// This file, top to bottom:
+//   1. connection state
+//   2. serial writes
+//   3. statistics, printed when the connection closes
+//   4. supervision frames
+//   5. frame reception (the state machine)
+//   6. retry primitives
+//   7. the API
 
 #include "link_layer.h"
 #include "serial_port.h"
@@ -17,16 +31,15 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-// After its final UA the transmitter keeps the port open for one timeout
-// interval so that a repeated DISC (the receiver never saw that UA) can be
-// answered. Set to 0 to skip it; closing then costs no extra time but a lost
-// final UA leaves the receiver waiting for its full retry budget.
-#define TX_CLOSE_LINGER 1
+////////////////////////////////////////////////
+// Connection state
+////////////////////////////////////////////////
 
 typedef enum
 {
@@ -42,7 +55,7 @@ typedef enum
     RX_OK_DATA,        // a complete information frame with a valid BCC2
     RX_IGNORED,        // malformed, truncated or oversized frame; discarded
     RX_BAD_BCC2,       // information frame whose data field failed its check
-    RX_TIMEOUT,        // the read was interrupted by the alarm
+    RX_TIMEOUT,        // the read was interrupted by our own alarm
     RX_IO_ERROR        // unrecoverable error on the serial port
 } RxResult;
 
@@ -57,6 +70,50 @@ typedef enum
     ST_READ_DATA           // de-stuffed data field, up to the closing flag
 } RxState;
 
+// Verdict on an information frame that has just been transmitted.
+typedef enum
+{
+    ACKED,      // the receiver accepted it: advance Ns
+    REJECTED,   // the receiver asked for it again: retransmit now
+    ACK_TIMEOUT,// no reply within the window: retransmit
+    ACK_ERROR   // the serial port failed
+} AckResult;
+
+// Counters gathered while a connection is open. They describe one connection,
+// which is why they live here and not in the pure frame module.
+typedef struct
+{
+    unsigned long setSent;
+    unsigned long setReceived;
+    unsigned long uaSent;
+    unsigned long uaReceived;
+    unsigned long discSent;
+    unsigned long discReceived;
+    unsigned long rrSent;
+    unsigned long rrReceived;
+    unsigned long rejSent;
+    unsigned long rejReceived;
+
+    unsigned long infoSent;
+    unsigned long infoReceived;
+
+    unsigned long retransmissions;
+    unsigned long timeouts;
+    unsigned long bcc1Errors;
+    unsigned long bcc2Errors;
+    unsigned long duplicateFrames;
+    unsigned long addressErrors;
+
+    // Useful payload. Counted once per packet queued for transmission, not once
+    // per retry, so payloadBytesSent equals the number of file bytes handed to
+    // the link layer.
+    unsigned long payloadBytesSent;
+    unsigned long payloadBytesReceived;
+
+    struct timespec startTime;
+    bool started;
+} LinkStats;
+
 static LinkStats linkStats;
 
 static LinkRole currentRole = ROLE_NONE;
@@ -70,7 +127,7 @@ static uint8_t rxExpected = 0; // next Ns the receiver expects to deliver (Rx si
 static unsigned char rxBody[MAX_PAYLOAD_SIZE + FRAME_BCC2_SIZE];
 
 ////////////////////////////////////////////////
-// Serial I/O helpers
+// Serial writes
 ////////////////////////////////////////////////
 
 // Write exactly "length" bytes, looping over short writes.
@@ -109,25 +166,137 @@ static int writeAll(const unsigned char *buf, size_t length)
 }
 
 ////////////////////////////////////////////////
+// Statistics
+////////////////////////////////////////////////
+
+static void statsReset(void)
+{
+    memset(&linkStats, 0, sizeof(linkStats));
+
+    linkStats.started = (clock_gettime(CLOCK_MONOTONIC, &linkStats.startTime) == 0);
+}
+
+static void statsCountSupervisionSent(unsigned char control)
+{
+    switch (control)
+    {
+    case C_SET:
+        linkStats.setSent++;
+        break;
+    case C_UA:
+        linkStats.uaSent++;
+        break;
+    case C_DISC:
+        linkStats.discSent++;
+        break;
+    case C_RR0:
+    case C_RR1:
+        linkStats.rrSent++;
+        break;
+    case C_REJ0:
+    case C_REJ1:
+        linkStats.rejSent++;
+        break;
+    default:
+        break;
+    }
+}
+
+static void statsCountSupervisionReceived(unsigned char control)
+{
+    switch (control)
+    {
+    case C_SET:
+        linkStats.setReceived++;
+        break;
+    case C_UA:
+        linkStats.uaReceived++;
+        break;
+    case C_DISC:
+        linkStats.discReceived++;
+        break;
+    case C_RR0:
+    case C_RR1:
+        linkStats.rrReceived++;
+        break;
+    case C_REJ0:
+    case C_REJ1:
+        linkStats.rejReceived++;
+        break;
+    default:
+        break;
+    }
+}
+
+static double statsElapsedSeconds(void)
+{
+    struct timespec now;
+
+    if (!linkStats.started)
+        return 0.0;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0.0;
+
+    return (double)(now.tv_sec - linkStats.startTime.tv_sec) +
+           (double)(now.tv_nsec - linkStats.startTime.tv_nsec) / 1.0e9;
+}
+
+static void statsPrint(void)
+{
+    const double elapsed = statsElapsedSeconds();
+    const double payload = (double)linkStats.payloadBytesSent +
+                           (double)linkStats.payloadBytesReceived;
+
+    printf("\n--- Link layer statistics ---\n");
+    printf("  elapsed ................ %8.3f s\n", elapsed);
+
+    printf("  SET   sent/received .... %8lu / %lu\n", linkStats.setSent, linkStats.setReceived);
+    printf("  UA    sent/received .... %8lu / %lu\n", linkStats.uaSent, linkStats.uaReceived);
+    printf("  DISC  sent/received .... %8lu / %lu\n", linkStats.discSent, linkStats.discReceived);
+    printf("  RR    sent/received .... %8lu / %lu\n", linkStats.rrSent, linkStats.rrReceived);
+    printf("  REJ   sent/received .... %8lu / %lu\n", linkStats.rejSent, linkStats.rejReceived);
+
+    printf("  I     sent/received .... %8lu / %lu\n", linkStats.infoSent, linkStats.infoReceived);
+    printf("  payload sent/received .. %8lu / %lu bytes\n",
+           linkStats.payloadBytesSent, linkStats.payloadBytesReceived);
+
+    printf("  retransmissions ........ %8lu\n", linkStats.retransmissions);
+    printf("  timeouts ............... %8lu\n", linkStats.timeouts);
+    printf("  BCC1 errors ............ %8lu\n", linkStats.bcc1Errors);
+    printf("  BCC2 errors ............ %8lu\n", linkStats.bcc2Errors);
+    printf("  duplicate frames ....... %8lu\n", linkStats.duplicateFrames);
+    printf("  wrong address/class .... %8lu\n", linkStats.addressErrors);
+
+    if (elapsed > 0.0)
+    {
+        printf("  throughput ............. %8.1f B/s\n", payload / elapsed);
+
+        // S = R / C, with R the useful payload rate in bit/s and C the channel
+        // bit rate. Ten bits go on the wire per octet (8-N-1).
+        if (linkParams.baudRate > 0)
+            printf("  efficiency ............. %8.2f %%\n",
+                   100.0 * payload * 10.0 / (elapsed * (double)linkParams.baudRate));
+    }
+
+    printf("-----------------------------\n");
+}
+
+////////////////////////////////////////////////
 // Supervision frames
 ////////////////////////////////////////////////
 
-// Address of a supervision frame, by who sends it and what it is.
-static unsigned char supervisionAddr(LinkRole sender, unsigned char control)
+// Address of a supervision frame, by who sends it and what it is: a command
+// carries our own address, a reply carries the address of the command it
+// answers. Only two of the frames we emit are replies to the peer's closing
+// handshake.
+static unsigned char supervisionAddr(unsigned char control)
 {
-    if (sender == ROLE_TX)
-    {
-        // Tx sends SET and DISC with A_TX; its UA answers the receiver's DISC,
-        // so it carries the address of that DISC.
+    if (currentRole == ROLE_TX)
         return (control == C_UA) ? A_RX : A_TX;
-    }
 
-    if (sender == ROLE_RX)
-    {
-        // Rx sends UA, RR and REJ with A_TX; its DISC answers the
-        // transmitter's DISC, so it carries the address of that DISC.
+    if (currentRole == ROLE_RX)
         return (control == C_DISC) ? A_RX : A_TX;
-    }
 
     return A_TX;
 }
@@ -136,7 +305,7 @@ static unsigned char supervisionAddr(LinkRole sender, unsigned char control)
 static int sendSupervision(unsigned char control)
 {
     unsigned char frame[SUPERVISION_FRAME_SIZE];
-    unsigned char address = supervisionAddr(currentRole, control);
+    unsigned char address = supervisionAddr(control);
 
     int built = frameBuildSupervision(frame, sizeof(frame), address, control);
     if (built != SUPERVISION_FRAME_SIZE)
@@ -145,7 +314,7 @@ static int sendSupervision(unsigned char control)
     if (writeAll(frame, (size_t)built) != 0)
         return -1;
 
-    linkStatsCountSupervisionSent(&linkStats, control);
+    statsCountSupervisionSent(control);
     return 0;
 }
 
@@ -155,17 +324,17 @@ static int sendSupervision(unsigned char control)
 static void sendReply(unsigned char control)
 {
     if (sendSupervision(control) != 0)
-        fprintf(stderr, "Could not send supervision frame 0x%02X.\n",
-                (unsigned int)control);
+        fprintf(stderr, "Could not send supervision frame %s.\n",
+                frameControlName(control));
 }
 
 ////////////////////////////////////////////////
-// LLCONNECT
+// Frame reception
 ////////////////////////////////////////////////
 
-// Which (address, control) pairs may this role accept? Anything else is a
-// frame for the other direction, or noise that happened to pass its BCC1.
-static int addressAccepted(unsigned char address, unsigned char control)
+// Which (address, control) pairs may this role accept? Anything else is a frame
+// for the other direction, or noise that happened to pass its BCC1.
+static bool addressAccepted(unsigned char address, unsigned char control)
 {
     if (currentRole == ROLE_RX)
     {
@@ -177,7 +346,7 @@ static int addressAccepted(unsigned char address, unsigned char control)
         if (address == A_RX)
             return control == C_UA;
 
-        return FALSE;
+        return false;
     }
 
     if (currentRole == ROLE_TX)
@@ -190,47 +359,44 @@ static int addressAccepted(unsigned char address, unsigned char control)
         if (address == A_RX)
             return control == C_DISC;
 
-        return FALSE;
+        return false;
     }
 
-    return FALSE;
+    return false;
 }
-
-////////////////////////////////////////////////
-// Frame reception
-////////////////////////////////////////////////
 
 // Read one frame from the serial port, byte by byte, and classify it.
 //
 // The machine hunts an opening flag, then consumes address, control and BCC1.
-// It validates and filters at BCC1 time, because the control field decides the
-// frame geometry: supervision frames end at the next flag, information frames
-// carry a de-stuffed data field followed by a BCC2 and then the flag.
+// It filters at BCC1 time because the control field decides the geometry:
+// supervision frames end at the next flag, information frames carry a
+// de-stuffed data field followed by a BCC2 and then the flag.
 //
-// On RX_OK_DATA the application packet is copied to "packet" if it fits in
-// "packetCapacity"; "*packetLen" receives its length. On RX_BAD_BCC2 the packet
-// is not copied but "*packetLen" and the control field are still reported, so
-// the caller can send the right REJ. "*addressOut" and "*controlOut" are set
-// for every supervision and data frame.
+// "packet" receives the de-stuffed application packet and *packetLen its
+// length, on RX_OK_DATA only. On RX_BAD_BCC2 the payload is dropped but the
+// control field is still reported, so the caller can send the right REJ.
+// *packetLen is 0 for every other result.
 static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
-                            int *packetLen, unsigned char *addressOut,
-                            unsigned char *controlOut)
+                            int *packetLen, unsigned char *controlOut)
 {
     RxState state = ST_HUNT_FLAG;
 
     unsigned char address = 0;
     unsigned char control = 0;
 
-    size_t filled = 0;    // de-stuffed bytes held in rxBody
-    int overflow = FALSE; // the data field did not fit in rxBody
-    int escape = FALSE;   // the previous byte was the escape octet
+    size_t filled = 0;     // de-stuffed bytes held in rxBody
+    bool overflow = false; // the data field did not fit in rxBody
+    bool escape = false;   // the previous byte was the escape octet
 
-    if (packet == NULL || packetLen == NULL || addressOut == NULL ||
-        controlOut == NULL || packetCapacity < 3)
+    if (packet == NULL || packetLen == NULL || controlOut == NULL)
+        return RX_IO_ERROR;
+
+    // A smaller buffer would turn every full-size information frame into
+    // RX_IGNORED, which at the receiver is indistinguishable from a dead line.
+    if (packetCapacity < MAX_PAYLOAD_SIZE)
         return RX_IO_ERROR;
 
     *packetLen = 0;
-    *addressOut = 0;
     *controlOut = 0;
 
     for (;;)
@@ -242,9 +408,10 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
         {
             if (errno == EINTR)
             {
-                // The alarm handler clears the flag; a signal from any other
-                // source leaves it set and must not fake a timeout.
-                if (isAlarmActive() == FALSE)
+                // Only our handler clears the flag, so a cleared flag means our
+                // own alarm fired. Any other signal leaves it set and must not
+                // fake a timeout: keep reading inside the same attempt.
+                if (!isAlarmActive())
                     return RX_TIMEOUT;
 
                 continue;
@@ -254,10 +421,14 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
             return RX_IO_ERROR;
         }
 
-        // No byte was consumed: keep the parser state and wait for the next
-        // one. Never re-use the previous "byte" value.
+        // serial_port.c blocks with VMIN = 1, so a zero-length read is not
+        // "nothing yet": it is end of file. Spinning on it would hang the
+        // program at 100% CPU until it is killed.
         if (result == 0)
-            continue;
+        {
+            fprintf(stderr, "Serial port reported end of file.\n");
+            return RX_IO_ERROR;
+        }
 
         switch (state)
         {
@@ -302,7 +473,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 break;
             }
 
-            if (addressAccepted(address, control) == FALSE)
+            if (!addressAccepted(address, control))
             {
                 linkStats.addressErrors++;
                 state = ST_HUNT_FLAG;
@@ -312,8 +483,8 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
             if (frameCIsInfo(control))
             {
                 filled = 0;
-                overflow = FALSE;
-                escape = FALSE;
+                overflow = false;
+                escape = false;
                 state = ST_READ_DATA;
             }
             else
@@ -330,23 +501,14 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 break;
             }
 
-            packet[0] = FRAME_FLAG;
-            packet[1] = address;
-            packet[2] = control;
-            packet[3] = frameBcc1(address, control);
-            packet[4] = FRAME_FLAG;
-
-            *packetLen = SUPERVISION_FRAME_SIZE;
-            *addressOut = address;
             *controlOut = control;
-
-            linkStatsCountSupervisionReceived(&linkStats, control);
+            statsCountSupervisionReceived(control);
             return RX_OK_SUPERVISION;
 
         case ST_READ_DATA:
             if (escape)
             {
-                escape = FALSE;
+                escape = false;
 
                 if (byte == FRAME_ESCAPE_FLAG)
                     byte = FRAME_FLAG;
@@ -362,13 +524,13 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 if (filled < sizeof(rxBody))
                     rxBody[filled++] = byte;
                 else
-                    overflow = TRUE;
+                    overflow = true;
                 break;
             }
 
             if (byte == FRAME_ESCAPE)
             {
-                escape = TRUE;
+                escape = true;
                 break;
             }
 
@@ -377,22 +539,20 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 if (filled < sizeof(rxBody))
                     rxBody[filled++] = byte;
                 else
-                    overflow = TRUE;
+                    overflow = true;
                 break;
             }
 
             // Closing flag. The last de-stuffed byte is the BCC2.
             state = ST_HUNT_FLAG;
 
-            if (overflow == TRUE || filled < 1)
+            if (overflow || filled < 1)
             {
                 // Oversized, or a header with no BCC2 at all.
                 return RX_IGNORED;
             }
 
-            *addressOut = address;
             *controlOut = control;
-            *packetLen = (int)(filled - 1);
 
             if (frameBcc2(rxBody, filled - 1) != rxBody[filled - 1])
             {
@@ -400,8 +560,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 return RX_BAD_BCC2;
             }
 
-            if ((size_t)(filled - 1) > packetCapacity)
-                return RX_IGNORED;
+            *packetLen = (int)(filled - 1);
 
             if (filled > 1)
                 memcpy(packet, rxBody, filled - 1);
@@ -411,35 +570,152 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
     }
 }
 
-// Wait for any supervision frame. Returns 1 and stores the control field on
-// success, 0 if the alarm fired first, -1 on an unrecoverable I/O error.
-static int waitSupervisionControl(unsigned char *controlOut)
+////////////////////////////////////////////////
+// Retry primitives
+////////////////////////////////////////////////
+
+// Wait, inside the current alarm window, for a supervision frame.
+//
+// Returns 1 and stores the control field on success, 0 if the alarm fired
+// first, -1 on an unrecoverable I/O error.
+//
+// Information frames are not what the callers of this function are waiting for,
+// with one exception that matters: at the receiver, a duplicate must still be
+// acknowledged. Dropping it would burn the transmitter's whole retry budget on
+// data that has already been delivered -- exactly what happens to a retransmit-
+// ted END whose RR was lost. One wait function for every supervision exchange
+// is what keeps that rule in a single place.
+static int waitControl(unsigned char *controlOut)
 {
-    unsigned char frame[SUPERVISION_FRAME_SIZE];
+    unsigned char packet[MAX_PAYLOAD_SIZE];
+    int length = 0;
+    unsigned char control = 0;
 
     for (;;)
     {
-        int length = 0;
-        unsigned char address = 0;
+        RxResult result = rxReadFrame(packet, sizeof(packet), &length, &control);
 
-        RxResult result = rxReadFrame(frame, sizeof(frame), &length, &address, controlOut);
-
-        switch (result)
-        {
-        case RX_OK_SUPERVISION:
-            return 1;
-
-        case RX_TIMEOUT:
+        if (result == RX_TIMEOUT)
             return 0;
 
-        case RX_IO_ERROR:
+        if (result == RX_IO_ERROR)
             return -1;
 
-        default:
-            // Data frames, rejected payloads and junk are not our business
-            // here; keep waiting inside the same attempt.
-            break;
+        if (result == RX_OK_SUPERVISION)
+        {
+            *controlOut = control;
+            return 1;
         }
+
+        // Below: information frames. The transmitter never accepts data, so
+        // this is the receiver's business only.
+        if (currentRole != ROLE_RX)
+            continue;
+
+        if (frameCGetNs(control) != rxExpected)
+        {
+            // Duplicate: discard the payload whatever its BCC2 says, and repeat
+            // the RR for the frame we are still expecting.
+            sendReply(C_RR(rxExpected));
+            continue;
+        }
+
+        if (result == RX_BAD_BCC2)
+        {
+            // New frame, damaged payload: ask for it again.
+            sendReply(C_REJ(rxExpected));
+            continue;
+        }
+
+        // A new, undamaged frame is deliberately not consumed or acknowledged
+        // here: only llReceive() accepts new data. The transmitter's timeout
+        // will repeat it, and the close handshake will see the repeat.
+    }
+}
+
+// Send a supervision frame and wait for the reply that answers it,
+// retransmitting the frame up to nRetransmissions extra times.
+//
+// Returns 0 once the expected reply arrives, -1 when every attempt failed.
+static int sendAndWait(unsigned char command, unsigned char expected)
+{
+    const int attempts = linkParams.nRetransmissions + 1;
+
+    for (int attempt = 1; attempt <= attempts; attempt++)
+    {
+        unsigned char control = 0;
+        int result;
+
+        if (sendSupervision(command) != 0)
+            return -1;
+
+        if (attempt > 1)
+            linkStats.retransmissions++;
+
+        startAlarm((unsigned)linkParams.timeout);
+
+        // Anything that is not the expected reply is ignored inside the same
+        // window: a stale RR, a leftover UA, a repeated DISC.
+        do
+        {
+            result = waitControl(&control);
+        } while (result == 1 && control != expected);
+
+        stopAlarm();
+
+        if (result < 0)
+            return -1;
+
+        if (result == 1)
+            return 0;
+
+        linkStats.timeouts++;
+        printf("Timeout waiting for %s (attempt %d of %d).\n",
+               frameControlName(expected), attempt, attempts);
+    }
+
+    return -1;
+}
+
+// The verdict on the information frame just transmitted.
+static AckResult waitAck(unsigned char ns)
+{
+    for (;;)
+    {
+        unsigned char control = 0;
+        int result = waitControl(&control);
+
+        if (result < 0)
+            return ACK_ERROR;
+
+        if (result == 0)
+        {
+            linkStats.timeouts++;
+            return ACK_TIMEOUT;
+        }
+
+        // Modulo-2 numbering makes both tests a single comparison:
+        //   RR,  Nr != Ns -> the receiver moved past our frame: acknowledged.
+        //   REJ, Nr == Ns -> the receiver rejects our frame: send it again.
+        // Anything else is stale (the receiver is behind us) and is ignored
+        // without ending the window.
+        if (frameCIsRR(control))
+        {
+            if (frameCGetNr(control) != ns)
+                return ACKED;
+
+            continue;
+        }
+
+        if (frameCIsREJ(control))
+        {
+            if (frameCGetNr(control) == ns)
+                return REJECTED;
+
+            continue;
+        }
+
+        // A leftover UA or an unexpected DISC: keep listening.
     }
 }
 
@@ -465,97 +741,40 @@ int llOpenTx(LinkLayer llParameters)
         return -1;
     }
 
-    linkParams = llParameters;
-    currentRole = ROLE_TX;
-    txNs = 0;
-    rxExpected = 0;
-    linkStatsReset(&linkStats);
-    resetAlarmCount();
-
     if (llParameters.timeout <= 0)
     {
         fprintf(stderr, "Invalid timeout (%d s).\n", llParameters.timeout);
         closeSerialPort();
-        currentRole = ROLE_NONE;
         return -1;
     }
 
-    // nRetransmissions counts retries after the first attempt: nTries = 3
-    // means at most four SET frames on the wire.
-    const int totalAttempts = llParameters.nRetransmissions + 1;
+    linkParams = llParameters;
+    currentRole = ROLE_TX;
+    txNs = 0;
+    rxExpected = 0;
+    stopAlarm();
+    statsReset();
 
-    for (int attempt = 1; attempt <= totalAttempts; attempt++)
+    // nRetransmissions counts retries after the first attempt: nTries = 3 means
+    // at most four SET frames on the wire.
+    if (sendAndWait(C_SET, C_UA) != 0)
     {
-        unsigned char control = 0;
-
-        if (sendSupervision(C_SET) != 0)
-        {
-            stopAlarm();
-            closeSerialPort();
-            currentRole = ROLE_NONE;
-            return -1;
-        }
-
-        if (attempt > 1)
-            linkStats.retransmissions++;
-
-        startAlarm((unsigned)llParameters.timeout);
-
-        int timedOut = FALSE;
-        int failed = FALSE;
-
-        for (;;)
-        {
-            int result = waitSupervisionControl(&control);
-
-            if (result < 0)
-            {
-                failed = TRUE;
-                break;
-            }
-
-            if (result == 0)
-            {
-                linkStats.timeouts++;
-                timedOut = TRUE;
-                break;
-            }
-
-            if (control == C_UA)
-            {
-                stopAlarm();
-                printf("UA received. Connection established.\n");
-                return 0;
-            }
-
-            // A stray DISC or a second UA: keep waiting inside this attempt.
-        }
-
-        stopAlarm();
-
-        if (failed == TRUE)
-        {
-            closeSerialPort();
-            currentRole = ROLE_NONE;
-            return -1;
-        }
-
-        if (timedOut == TRUE)
-            printf("Timeout waiting for UA (attempt %d of %d).\n", attempt, totalAttempts);
+        closeSerialPort();
+        currentRole = ROLE_NONE;
+        fprintf(stderr, "Connection failed: no UA after %d attempts.\n",
+                llParameters.nRetransmissions + 1);
+        return -1;
     }
 
-    closeSerialPort();
-    currentRole = ROLE_NONE;
-    fprintf(stderr, "Maximum number of retransmissions reached. Connection failed.\n");
-    return -1;
+    printf("UA received. Connection established.\n");
+    return 0;
 }
 
 // Open the serial port as receiver and wait for a SET frame.
 //
 // The wait is bounded, by requirement: (nRetransmissions + 1) timeout rounds.
 // With the values in main.c that is four rounds of four seconds, so the
-// transmitter has a sixteen second window to show up after the receiver
-// starts.
+// transmitter has a sixteen second window to show up after the receiver starts.
 int llOpenRx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -575,78 +794,56 @@ int llOpenRx(LinkLayer llParameters)
         return -1;
     }
 
+    if (llParameters.timeout <= 0)
+    {
+        fprintf(stderr, "Invalid timeout (%d s).\n", llParameters.timeout);
+        closeSerialPort();
+        return -1;
+    }
+
     linkParams = llParameters;
     currentRole = ROLE_RX;
     txNs = 0;
     rxExpected = 0;
     stopAlarm();
-    resetAlarmCount();
-    linkStatsReset(&linkStats);
+    statsReset();
 
-    if (llParameters.timeout <= 0)
-    {
-        fprintf(stderr, "Invalid timeout (%d s).\n", llParameters.timeout);
-        closeSerialPort();
-        currentRole = ROLE_NONE;
-        return -1;
-    }
+    const int rounds = llParameters.nRetransmissions + 1;
 
-    const int totalRounds = llParameters.nRetransmissions + 1;
-    int round = 1;
-
-    startAlarm((unsigned)llParameters.timeout);
-
-    while (round <= totalRounds)
+    for (int round = 1; round <= rounds; round++)
     {
         unsigned char control = 0;
-        int result = waitSupervisionControl(&control);
+        int result;
+
+        startAlarm((unsigned)llParameters.timeout);
+
+        do
+        {
+            result = waitControl(&control);
+        } while (result == 1 && control != C_SET);
+
+        stopAlarm();
 
         if (result < 0)
-        {
-            stopAlarm();
-            closeSerialPort();
-            currentRole = ROLE_NONE;
-            return -1;
-        }
+            break;
 
-        if (result == 0)
-        {
-            linkStats.timeouts++;
-            printf("Timeout waiting for SET (round %d of %d).\n", round, totalRounds);
-            round++;
-
-            if (round <= totalRounds)
-                startAlarm((unsigned)llParameters.timeout);
-
-            continue;
-        }
-
-        if (control == C_SET)
+        if (result == 1)
         {
             printf("SET received. Sending UA.\n");
 
             if (sendSupervision(C_UA) != 0)
-            {
-                stopAlarm();
-                closeSerialPort();
-                currentRole = ROLE_NONE;
-                return -1;
-            }
+                break;
 
-            stopAlarm();
             return 0;
         }
 
-        // A DISC from a transmitter that gave up, or a stray UA. Wait for SET
-        // without spending one of the rounds.
-        printf("Ignoring supervision frame 0x%02X while waiting for SET.\n",
-               (unsigned int)control);
+        linkStats.timeouts++;
+        printf("Timeout waiting for SET (round %d of %d).\n", round, rounds);
     }
 
-    stopAlarm();
     closeSerialPort();
     currentRole = ROLE_NONE;
-    fprintf(stderr, "No SET received. Connection failed.\n");
+    fprintf(stderr, "Connection failed: no SET received.\n");
     return -1;
 }
 
@@ -667,9 +864,9 @@ int llSend(const unsigned char *buf, int bufSize)
         return -1;
 
     unsigned char wire[MAX_FRAME_SIZE];
-    const int totalAttempts = linkParams.nRetransmissions + 1;
+    const int attempts = linkParams.nRetransmissions + 1;
 
-    for (int attempt = 1; attempt <= totalAttempts; attempt++)
+    for (int attempt = 1; attempt <= attempts; attempt++)
     {
         int built = frameBuildInfo(wire, sizeof(wire), A_TX, txNs, buf, (size_t)bufSize);
 
@@ -690,62 +887,23 @@ int llSend(const unsigned char *buf, int bufSize)
             linkStats.payloadBytesSent += (unsigned long)bufSize;
 
         startAlarm((unsigned)linkParams.timeout);
-
-        int failed = FALSE;
-
-        for (;;)
-        {
-            unsigned char control = 0;
-            int result = waitSupervisionControl(&control);
-
-            if (result < 0)
-            {
-                failed = TRUE;
-                break;
-            }
-
-            if (result == 0)
-            {
-                linkStats.timeouts++;
-                break; // retransmit the same frame
-            }
-
-            if (frameCIsRR(control))
-            {
-                unsigned char nr = frameCGetNr(control) ? 1u : 0u;
-
-                if (nr == (unsigned char)(txNs ^ 1u))
-                {
-                    stopAlarm();
-                    txNs = (uint8_t)(txNs ^ 1u);
-                    return bufSize;
-                }
-
-                // Stale RR: the receiver is still waiting for the frame we
-                // already sent. Nothing to do but keep listening.
-                continue;
-            }
-
-            if (frameCIsREJ(control))
-            {
-                unsigned char nr = frameCGetNr(control) ? 1u : 0u;
-
-                if (nr == txNs)
-                    break; // retransmit immediately
-
-                continue;
-            }
-
-            // UA left over from the open handshake, or anything else.
-        }
-
+        AckResult ack = waitAck(txNs);
         stopAlarm();
 
-        if (failed == TRUE)
+        if (ack == ACKED)
+        {
+            txNs ^= 1u;
+            return bufSize;
+        }
+
+        if (ack == ACK_ERROR)
             return -1;
+
+        // ACK_TIMEOUT and REJECTED both fall through: retransmit the same
+        // number and the same bytes.
     }
 
-    fprintf(stderr, "llSend: no acknowledgement after %d attempts.\n", totalAttempts);
+    fprintf(stderr, "llSend: no acknowledgement after %d attempts.\n", attempts);
     return -1;
 }
 
@@ -764,12 +922,11 @@ int llReceive(unsigned char *buf)
 
     for (;;)
     {
-        unsigned char address = 0;
         unsigned char control = 0;
         int length = 0;
 
         startAlarm((unsigned)linkParams.timeout);
-        RxResult result = rxReadFrame(buf, MAX_PAYLOAD_SIZE, &length, &address, &control);
+        RxResult result = rxReadFrame(buf, MAX_PAYLOAD_SIZE, &length, &control);
         stopAlarm();
 
         if (result == RX_TIMEOUT)
@@ -785,28 +942,30 @@ int llReceive(unsigned char *buf)
         {
             if (control == C_SET)
             {
-                // The transmitter lost our UA and is re-sending SET.
-                // Re-acknowledging is idempotent.
-                linkStats.duplicateFrames++;
+                // The transmitter lost our UA and is repeating SET.
+                // Re-acknowledging is idempotent, and it is not a duplicate
+                // information frame: "SET received" is where the repeat shows.
                 sendReply(C_UA);
                 continue;
             }
 
             if (control == C_DISC)
             {
-                printf("DISC received while receiving data; ignored.\n");
-                continue;
+                // The transmitter gave up mid-transfer. Stop receiving; the
+                // application runs the close handshake, which answers the next
+                // DISC the transmitter sends.
+                fprintf(stderr, "DISC received during the transfer; "
+                                "the transmitter has aborted.\n");
+                return -1;
             }
 
             continue;
         }
 
-        // An information frame, possibly with a damaged payload.
-        unsigned char ns = frameCGetNs(control) ? 1u : 0u;
-
-        if (ns != rxExpected)
+        // An information frame, possibly with a damaged data field.
+        if (frameCGetNs(control) != rxExpected)
         {
-            // Duplicate: discard the payload whatever its BCC2 says and repeat
+            // Duplicate: discard the payload whatever its BCC2 says, and repeat
             // the RR for the frame we are still expecting.
             linkStats.duplicateFrames++;
             sendReply(C_RR(rxExpected));
@@ -821,10 +980,7 @@ int llReceive(unsigned char *buf)
             continue;
         }
 
-        if (length < 0 || length > MAX_PAYLOAD_SIZE)
-            continue;
-
-        rxExpected = (uint8_t)(rxExpected ^ 1u);
+        rxExpected ^= 1u;
         sendReply(C_RR(rxExpected));
 
         linkStats.infoReceived++;
@@ -841,241 +997,118 @@ int llReceive(unsigned char *buf)
 // Close the transmitter: DISC -> DISC -> UA.
 int llCloseTx(void)
 {
-    stopAlarm();
-
     if (currentRole != ROLE_TX || linkParams.timeout <= 0)
         return -1;
 
-    const int totalAttempts = linkParams.nRetransmissions + 1;
-    unsigned char control = 0;
-    int gotDisc = FALSE;
     int status = 0;
-
-    // 1. Send DISC and wait for the receiver's DISC.
-    for (int attempt = 1; attempt <= totalAttempts && gotDisc == FALSE; attempt++)
-    {
-        if (sendSupervision(C_DISC) != 0)
-        {
-            status = -1;
-            break;
-        }
-
-        if (attempt > 1)
-            linkStats.retransmissions++;
-
-        startAlarm((unsigned)linkParams.timeout);
-
-        for (;;)
-        {
-            int result = waitSupervisionControl(&control);
-
-            if (result < 0)
-            {
-                status = -1;
-                break;
-            }
-
-            if (result == 0)
-            {
-                linkStats.timeouts++;
-                break;
-            }
-
-            if (control == C_DISC)
-            {
-                gotDisc = TRUE;
-                break;
-            }
-        }
-
-        stopAlarm();
-
-        if (status < 0)
-            break;
-    }
-
-    if (status < 0 || gotDisc == FALSE)
-    {
-        stopAlarm();
-        if (closeSerialPort() < 0)
-            perror("closeSerialPort");
-        linkStatsPrint(&linkStats);
-        currentRole = ROLE_NONE;
-        fprintf(stderr, "Close handshake failed: no DISC from the receiver.\n");
-        return -1;
-    }
-
-    // 2. Answer with UA carrying the address of the DISC we are answering.
-    if (sendSupervision(C_UA) != 0)
-        status = -1;
-
-#if TX_CLOSE_LINGER
-    // 3. Stay around for one timeout interval. If that UA was lost the
-    //    receiver re-sends DISC when its own timeout expires, and each DISC
-    //    seen here restarts the window, so a peer that keeps retrying keeps
-    //    being answered.
-    if (status == 0)
-    {
-        int resends = 0;
-
-        for (;;)
-        {
-            startAlarm((unsigned)linkParams.timeout);
-            int result = waitSupervisionControl(&control);
-            stopAlarm();
-
-            if (result <= 0)
-                break; // timeout, or a port error we cannot recover from
-
-            if (control != C_DISC)
-                continue;
-
-            if (resends >= linkParams.nRetransmissions)
-                break;
-
-            resends++;
-
-            if (sendSupervision(C_UA) != 0)
-                break;
-        }
-    }
-#endif
 
     stopAlarm();
 
-    if (closeSerialPort() < 0)
-        perror("closeSerialPort");
+    if (sendAndWait(C_DISC, C_DISC) != 0)
+    {
+        fprintf(stderr, "Close handshake failed: no DISC from the receiver.\n");
+        status = -1;
+    }
+    else if (sendSupervision(C_UA) != 0)
+    {
+        // Answering with UA carrying the address of the DISC we just received.
+        status = -1;
+    }
+    else
+    {
+        // Linger for up to (nRetransmissions + 1) windows. If our UA was lost
+        // the receiver repeats its DISC when its own timeout expires, and every
+        // repeat must be answered. The first quiet window ends the linger, so
+        // the common case costs exactly one timeout interval.
+        unsigned char control = 0;
+        const int windows = linkParams.nRetransmissions + 1;
 
-    linkStatsPrint(&linkStats);
+        for (int i = 0; i < windows; i++)
+        {
+            startAlarm((unsigned)linkParams.timeout);
+            int result = waitControl(&control);
+            stopAlarm();
+
+            if (result != 1)
+                break;
+
+            if (control == C_DISC && sendSupervision(C_UA) != 0)
+                break;
+        }
+    }
+
+    closeSerialPort();
+    statsPrint();
     currentRole = ROLE_NONE;
-    printf("Serial port closed (transmitter).\n");
 
-    return (status == 0) ? 0 : -1;
+    if (status == 0)
+        printf("Serial port closed (transmitter).\n");
+
+    return status;
 }
 
 // Close the receiver: wait for DISC, answer DISC, wait for UA.
 int llCloseRx(void)
 {
-    stopAlarm();
-
     if (currentRole != ROLE_RX || linkParams.timeout <= 0)
         return -1;
 
-    const int totalAttempts = linkParams.nRetransmissions + 1;
-    unsigned char control = 0;
-    int gotDisc = FALSE;
-    int gotUa = FALSE;
     int status = 0;
+    bool gotDisc = false;
+    const int rounds = linkParams.nRetransmissions + 1;
 
-    // 1. Wait for the transmitter's DISC.
-    for (int attempt = 1; attempt <= totalAttempts && gotDisc == FALSE; attempt++)
+    stopAlarm();
+
+    // 1. Wait for the transmitter's DISC. waitControl() keeps acknowledging a
+    //    retransmitted END, so a lost RR for the last packet costs the
+    //    transmitter one retry instead of its whole budget.
+    for (int round = 1; round <= rounds; round++)
     {
+        unsigned char control = 0;
+        int result;
+
         startAlarm((unsigned)linkParams.timeout);
 
-        for (;;)
+        do
         {
-            int result = waitSupervisionControl(&control);
-
-            if (result < 0)
-            {
-                status = -1;
-                break;
-            }
-
-            if (result == 0)
-            {
-                linkStats.timeouts++;
-                break;
-            }
-
-            if (control == C_DISC)
-            {
-                gotDisc = TRUE;
-                break;
-            }
-        }
+            result = waitControl(&control);
+        } while (result == 1 && control != C_DISC);
 
         stopAlarm();
 
-        if (status < 0)
-            break;
-    }
-
-    if (status < 0 || gotDisc == FALSE)
-    {
-        stopAlarm();
-        if (closeSerialPort() < 0)
-            perror("closeSerialPort");
-        linkStatsPrint(&linkStats);
-        currentRole = ROLE_NONE;
-        fprintf(stderr, "Close handshake failed: no DISC from the transmitter.\n");
-        return -1;
-    }
-
-    // 2. Answer with DISC (A=0x01) and wait for the transmitter's UA.
-    for (int attempt = 1; attempt <= totalAttempts && gotUa == FALSE; attempt++)
-    {
-        if (sendSupervision(C_DISC) != 0)
+        if (result < 0)
         {
+            fprintf(stderr, "Close handshake failed: serial port error.\n");
             status = -1;
             break;
         }
 
-        if (attempt > 1)
-            linkStats.retransmissions++;
-
-        startAlarm((unsigned)linkParams.timeout);
-
-        for (;;)
+        if (result == 1)
         {
-            int result = waitSupervisionControl(&control);
-
-            if (result < 0)
-            {
-                status = -1;
-                break;
-            }
-
-            if (result == 0)
-            {
-                linkStats.timeouts++;
-                break;
-            }
-
-            if (control == C_UA)
-            {
-                gotUa = TRUE;
-                break;
-            }
-
-            if (control == C_DISC)
-            {
-                // The transmitter re-sent its DISC, so our DISC was probably
-                // lost. Answer again on the next attempt.
-                break;
-            }
+            gotDisc = true;
+            break;
         }
 
-        stopAlarm();
-
-        if (status < 0)
-            break;
+        linkStats.timeouts++;
+        printf("Timeout waiting for DISC (round %d of %d).\n", round, rounds);
     }
 
-    stopAlarm();
+    if (status == 0 && !gotDisc)
+        fprintf(stderr, "Close handshake failed: no DISC from the transmitter.\n");
 
-    if (closeSerialPort() < 0)
-        perror("closeSerialPort");
-
-    linkStatsPrint(&linkStats);
-    currentRole = ROLE_NONE;
-
-    if (status < 0 || gotUa == FALSE)
+    // 2. Answer with DISC (A = 0x01) and wait for the transmitter's UA.
+    if (status == 0 && gotDisc && sendAndWait(C_DISC, C_UA) != 0)
     {
         fprintf(stderr, "Close handshake failed: no UA from the transmitter.\n");
-        return -1;
+        status = -1;
     }
 
-    printf("Serial port closed (receiver).\n");
-    return 0;
+    closeSerialPort();
+    statsPrint();
+    currentRole = ROLE_NONE;
+
+    if (status == 0)
+        printf("Serial port closed (receiver).\n");
+
+    return status;
 }
