@@ -3,20 +3,14 @@
 
 #include <stdbool.h>
 
-// Install the SIGALRM handler. Must be called before the first startAlarm().
-// Returns 0 on success, -1 on failure.
+// Must be installed before the first startAlarm().
 int setupAlarmHandler(void);
 
-// Arm the timer for "seconds". The flag is set before the timer, so the handler
-// always finds it set when it fires.
 void startAlarm(unsigned seconds);
 
-// Cancel a pending timer and clear the flag.
 void stopAlarm(void);
 
-// True while the alarm armed by startAlarm() has not fired yet. The protocol
-// code uses it to tell "our own timeout interrupted the read" from "something
-// else interrupted the read".
+// Tells our own timeout apart from any other signal interrupting a read.
 bool isAlarmActive(void);
 
 #endif // ALARM_SIGACTION_H
