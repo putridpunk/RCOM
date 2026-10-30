@@ -1,27 +1,12 @@
+// packets:
 //
-// Application layer protocol.
+//   START: C=1 | TLVs
+//   DATA : C=2 | L2 | L1 | data     size = 256*L2 + L1
+//   END  : C=3 | same TLVs as START
 //
-// Packets, as the lab spec defines them:
+// TLVs: type 0 is the size, 4 bytes big endian. type 1 is the name, 0..255 raw
+// bytes with no \0. size goes first, unknown types get skipped by their length.
 //
-//   START : C=1 | TLV parameters
-//   DATA  : C=2 | L2 | L1 | K payload bytes,  K = 256*L2 + L1
-//   END   : C=3 | the same TLV parameters sent in START
-//
-// Our TLV encoding:
-//   type 0, file size : length 4, unsigned 32-bit big-endian count
-//   type 1, file name : length 0..255, raw bytes, no terminator
-//   type 0 comes first. Unknown types get skipped by their length.
-//
-// START and END are built from the same metadata block, so END repeats START
-// byte for byte. The receiver checks exactly that with memcmp, rather than
-// comparing field by field and trusting that it listed them all.
-//
-// The output path comes from the receiver's own command line, never from the
-// wire. The name TLV is carried and verified; it isn't obeyed.
-//
-// This module builds and parses whole packets, and writes the K data bytes of a
-// DATA packet. Nothing else goes near the wire. An RR from llSend means the link
-// took the frame, not that the receiver wrote it to disk.
 
 #include "application_layer.h"
 #include "link_layer.h"
@@ -31,8 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ---- Protocol constants ----
-
+// packet types
 #define APP_C_START 1
 #define APP_C_DATA 2
 #define APP_C_END 3
@@ -41,19 +25,18 @@
 #define TLV_TYPE_NAME 1
 
 #define SIZE_VALUE_LEN 4
-#define MAX_NAME_LEN 255
-// Worst case: size TLV (2 + 4) followed by a full-length name TLV.
+#define MAX_NAME_LEN 255 // one byte of length, so this is the ceiling
+// size TLV (2+4) plus a name TLV at full length
 #define MAX_METADATA_SIZE (2 + SIZE_VALUE_LEN + 2 + MAX_NAME_LEN)
 
-// The size TLV is four octets, so the file has to fit in 32 bits.
+// the size is 4 octets so the file has to fit in 32 bits
 #define MAX_FILE_SIZE 0xFFFFFFFFUL
 
-// Fragment per DATA packet. A packet holds MAX_PAYLOAD_SIZE bytes, three of
-// which are the C, L2 and L1 fields.
+// how much file data goes in each DATA packet. 3 of the payload bytes are the
+// C/L2/L1 header.
 //
-// Override with -DAPP_DATA_CHUNK=... for the efficiency measurements. The
-// receiver reads K from L2/L1 of each packet, so both ends stay compatible with
-// no other change.
+// build with -DAPP_DATA_CHUNK=... for the efficiency measurements. rx reads K
+// back out of L2/L1 so both ends stay compatible without changing anything else
 #ifndef APP_DATA_CHUNK
 #define APP_DATA_CHUNK (MAX_PAYLOAD_SIZE - 3)
 #endif
@@ -63,19 +46,13 @@ _Static_assert(APP_DATA_CHUNK >= 1 && APP_DATA_CHUNK + 3 <= MAX_PAYLOAD_SIZE,
 _Static_assert(MAX_METADATA_SIZE + 3 <= MAX_PAYLOAD_SIZE,
                "START/END metadata must fit in one packet");
 
-// Silent timeouts the receiver tolerates between packets.
-//
-// It has to outlast the transmitter's own budget for a single frame,
-// (nRetransmissions + 1) * (timeout + frame time), so that the transmitter is
-// always the side declaring failure. With main.c's values that's
-// 4 * (4 + 4.2) = 32.8 s in the worst case worth caring about, and 12 * 4 s =
-// 48 s clears it. At 2400 baud a full frame already takes longer than the
-// timeout, so nothing works down there anyway.
+// how many empty llReceive rounds rx puts up with before giving up. has to be
+// longer than tx's own budget for a single frame, else tx gives up first and rx
+// sits there forever. 12*4 = 48s vs ~24s worst case for tx.
+// arbitrary, just needs the margin
 #define RX_SILENT_ROUNDS 12
 
-// ---- Packet construction and parsing ----
-
-// Build "C | L2 | L1 | payload". Returns the packet length, or 0 on error.
+// C | L2 | L1 | payload. returns the packet length, 0 on error
 static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char type,
                           const unsigned char *payload, size_t payloadLen)
 {
@@ -89,8 +66,8 @@ static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char typ
         return 0;
 
     out[0] = type;
-    out[1] = (unsigned char)((payloadLen >> 8) & 0xFF); // L2, high byte
-    out[2] = (unsigned char)(payloadLen & 0xFF);        // L1, low byte
+    out[1] = (unsigned char)((payloadLen >> 8) & 0xFF); // L2 = high byte
+    out[2] = (unsigned char)(payloadLen & 0xFF);        // L1 = low byte
 
     if (payloadLen > 0)
         memcpy(out + 3, payload, payloadLen);
@@ -98,7 +75,7 @@ static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char typ
     return payloadLen + 3;
 }
 
-// Returns the type, or -1 when L2/L1 disagrees with the length actually read.
+// returns the type, or -1 if L2/L1 doesn't match what we actually read
 static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *payloadLen)
 {
     size_t declared;
@@ -115,8 +92,8 @@ static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *pa
     return (int)packet[0];
 }
 
-// Build the TLV block that START and END both carry. Returns its length, or 0 if
-// the arguments can't be encoded.
+// builds the TLV block, START and END both use this. returns its length, 0 if
+// it doesn't fit
 static size_t buildMetadata(unsigned char *out, size_t capacity,
                             unsigned long fileSize, const char *filename)
 {
@@ -126,9 +103,9 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     if (out == NULL || fileSize > MAX_FILE_SIZE)
         return 0;
 
-    // A name longer than a one-octet length can't be announced. Refuse the
-    // transfer instead of quietly leaving it out: START and END would still
-    // agree with each other, so nothing downstream would notice.
+    // can't announce a name this long, one byte of length. refusing is the only
+    // option, if we just left the name out START and END would still agree
+    // with each other and nothing downstream would notice
     if (nameLen > MAX_NAME_LEN)
         return 0;
 
@@ -153,9 +130,8 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     return written;
 }
 
-// Walk the TLVs of a START packet and pull out the file size.
-// Returns 0 on success, -1 on a structural problem or a missing/duplicate size.
-// Unknown types are skipped by their length, which the spec allows.
+// walks the START TLVs and gets the size out. 0 on success, -1 on anything
+// wrong (bad structure, no size, two sizes)
 static int parseSize(const unsigned char *tlv, size_t len, unsigned long *fileSize)
 {
     size_t pos = 0;
@@ -200,9 +176,8 @@ static int parseSize(const unsigned char *tlv, size_t len, unsigned long *fileSi
     return haveSize ? 0 : -1;
 }
 
-// ---- Transmitter ----
-
-// Hand a finished packet to the link layer.
+// hand a finished packet to the link layer. careful: an RR here means the frame
+// left tx, not that rx wrote anything to disk
 static int sendPacket(const unsigned char *packet, size_t packetLen)
 {
     if (packet == NULL || packetLen == 0 || packetLen > MAX_PAYLOAD_SIZE)
@@ -258,7 +233,8 @@ static void applicationTx(const LinkLayer *params, const char *filename)
 
     rewind(file);
 
-    // One metadata block, two packets: END is START with a different type.
+    // one metadata block, then START and END are the same bytes with a
+    // different C
     unsigned char metadata[MAX_METADATA_SIZE];
     const size_t metadataLen = buildMetadata(metadata, sizeof(metadata),
                                              (unsigned long)fileSize, filename);
@@ -318,8 +294,6 @@ static void applicationTx(const LinkLayer *params, const char *filename)
         fprintf(stderr, "Transfer of %s failed.\n", filename);
 }
 
-// ---- Receiver ----
-
 static void applicationRx(const LinkLayer *params, const char *filename)
 {
     if (llOpenRx(*params) != 0)
@@ -355,7 +329,8 @@ static void applicationRx(const LinkLayer *params, const char *filename)
 
         if (length == 0)
         {
-            // Bounded, so a transmitter that vanished can't hang us forever.
+            // empty round, count them. bounded so a tx that dies doesn't leave
+            // us hanging forever
             if (++idleCount > RX_SILENT_ROUNDS)
             {
                 failure = "no data for too long";
@@ -395,6 +370,8 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
+            // path comes from OUR argv. whatever name is on the wire gets
+            // checked (END vs START) but never used to open anything
             file = fopen(filename, "wb");
 
             if (file == NULL)
@@ -404,7 +381,8 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            // Kept verbatim so END can be compared against it byte for byte.
+            // kept exactly as it came so END can be memcmp'd against it, no
+            // field by field comparison
             memcpy(startMetadata, packet + 3, payloadLen);
             startMetadataLen = payloadLen;
             sawStart = true;
@@ -442,7 +420,8 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            // "END repeats the information in START", checked literally.
+            // spec says END repeats the info in START so thats what we check,
+            // literally the same bytes
             if (payloadLen != startMetadataLen ||
                 memcmp(packet + 3, startMetadata, startMetadataLen) != 0)
             {
@@ -456,7 +435,7 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            break; // the only clean exit from this loop
+            break; // only way out of the loop that isn't a failure
         }
         else
         {
@@ -470,9 +449,7 @@ static void applicationRx(const LinkLayer *params, const char *filename)
 
     if (failure != NULL && sawStart)
     {
-        // Don't leave a truncated file behind. "make check_files" is
-        // "diff -s ... || exit 0", so a half-written file reads as a near miss
-        // in the demo and hides what actually went wrong.
+        // delete the leftover file.
         remove(filename);
         fprintf(stderr, "Partial file %s removed.\n", filename);
     }
@@ -486,13 +463,10 @@ static void applicationRx(const LinkLayer *params, const char *filename)
         printf("File %s received successfully (%lu bytes).\n", filename, receivedSize);
 }
 
-// ---- Entry point ----
-
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    // Line-buffered, so a piped or tee'd demo transcript arrives line by line
-    // instead of in 4 KB blocks.
+    // line buffered
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     LinkLayer params;

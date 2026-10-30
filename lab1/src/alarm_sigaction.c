@@ -4,8 +4,8 @@
 #include <string.h>
 #include <unistd.h> // alarm(2)
 
-// The handler writes it and the protocol reads it, so sig_atomic_t. Nothing
-// else is shared with the handler: printf(3) isn't async-signal-safe.
+// the handler writes this and the protocol reads it -> sig_atomic_t
+// (no printf in the handler, it's not async-signal-safe)
 static volatile sig_atomic_t alarmEnabled = 0;
 
 static void alarmHandler(int sig)
@@ -21,8 +21,8 @@ int setupAlarmHandler(void)
     memset(&act, 0, sizeof(act));
     act.sa_handler = alarmHandler;
     sigemptyset(&act.sa_mask);
-    // No SA_RESTART on purpose. The blocking read() has to come back with
-    // EINTR, or the protocol never notices the timeout.
+    // NO SA_RESTART. without it the blocked read() comes back with EINTR when
+    // the alarm fires, which is the only way the protocol ever sees a timeout
     act.sa_flags = 0;
 
     if (sigaction(SIGALRM, &act, NULL) == -1)
@@ -39,7 +39,7 @@ void startAlarm(unsigned seconds)
 
 void stopAlarm(void)
 {
-    alarm(0);
+    alarm(0); // 0 cancels a pending alarm
     alarmEnabled = 0;
 }
 
