@@ -352,6 +352,9 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
 
     for (;;)
     {
+        if (!isAlarmActive())
+            return RX_TIMEOUT;
+
         unsigned char byte = 0;
         int result = readByteSerialPort(&byte);
 
@@ -548,6 +551,9 @@ static int waitControl(unsigned char *controlOut)
             *controlOut = control;
             return 1;
         }
+
+        if (result == RX_IGNORED)
+            continue;
 
         // everything from here down is an I frame. tx never accepts data so
         // this is rx's problem only
