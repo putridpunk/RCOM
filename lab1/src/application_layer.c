@@ -1,21 +1,9 @@
-//
 // Application layer protocol implementation.
 //
-// Packet formats, as defined by the lab specification:
+// START: C=1 | TLVs   DATA: C=2 | L2 | L1 | K bytes   END: C=3 | TLVs
+// TLV 0 = size (4B big-endian), TLV 1 = name (0..255 raw); unknown types skipped.
 //
-//   START : C=1 | TLV parameters
-//   DATA  : C=2 | L2 | L1 | K payload bytes,  K = 256*L2 + L1
-//   END   : C=3 | the same TLV parameters sent in START
-//
-// TLV encoding used here (agreed convention, documented so both ends match):
-//   type 0, file size : length 4, value is an unsigned 32-bit big-endian count
-//   type 1, file name : length 0..255, value is the raw name, no terminator
-//   type 0 comes first. Unknown types are skipped by their length.
-//
-// Layering: this module only builds and parses whole packets. It writes the K
-// fragment bytes of a DATA packet and nothing else -- no packet header, no TLV,
-// no checksum. An RR returned by llSend means the link accepted the frame, not
-// that the receiver managed to write it to disk.
+// An RR means the link took the frame, not that the receiver wrote it to disk.
 
 #include "application_layer.h"
 #include "link_layer.h"
@@ -24,10 +12,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-////////////////////////////////////////////////
-// Protocol constants
-////////////////////////////////////////////////
 
 #define APP_C_START 1
 #define APP_C_DATA 2
@@ -38,27 +22,30 @@
 
 #define SIZE_VALUE_LEN 4
 #define MAX_NAME_LEN 255
-// Worst case metadata: size TLV (2 + 4) followed by a full length name TLV.
 #define MAX_METADATA_SIZE (2 + SIZE_VALUE_LEN + 2 + MAX_NAME_LEN)
 
+// the size TLV is four octets
 #define MAX_FILE_SIZE 0xFFFFFFFFUL
 
-// A packet carries at most MAX_PAYLOAD_SIZE bytes, three of which are the
-// C, L2 and L1 header fields.
-#define DATA_CHUNK (MAX_PAYLOAD_SIZE - 3)
+// Override with -DAPP_DATA_CHUNK=... to measure efficiency with smaller frames;
+// the receiver reads K from L2/L1, so both ends stay compatible.
+#ifndef APP_DATA_CHUNK
+#define APP_DATA_CHUNK (MAX_PAYLOAD_SIZE - 3)
+#endif
 
-////////////////////////////////////////////////
-// Packet construction and parsing
-////////////////////////////////////////////////
+_Static_assert(APP_DATA_CHUNK >= 1 && APP_DATA_CHUNK + 3 <= MAX_PAYLOAD_SIZE,
+               "APP_DATA_CHUNK must leave room for the packet header");
+_Static_assert(MAX_METADATA_SIZE + 3 <= MAX_PAYLOAD_SIZE,
+               "START/END metadata must fit in one packet");
 
-// Build "C | L2 | L1 | payload". Returns the packet length, or 0 on error.
+// Must outlast the transmitter's own budget for one frame (33 s worst case),
+// otherwise both ends abort at the same instant. 12 * 4 s.
+#define RX_SILENT_ROUNDS 12
+
 static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char type,
                           const unsigned char *payload, size_t payloadLen)
 {
-    if (out == NULL)
-        return 0;
-
-    if (payloadLen > 0xFFFF)
+    if (out == NULL || payloadLen > 0xFFFF)
         return 0;
 
     if (payload == NULL && payloadLen > 0)
@@ -77,8 +64,6 @@ static size_t buildPacket(unsigned char *out, size_t capacity, unsigned char typ
     return payloadLen + 3;
 }
 
-// Validate "C | L2 | L1 | payload". Returns the type, or -1 if the declared
-// length does not match the packet length exactly.
 static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *payloadLen)
 {
     size_t declared;
@@ -95,75 +80,20 @@ static int parsePacket(const unsigned char *packet, size_t packetLen, size_t *pa
     return (int)packet[0];
 }
 
-// Parse the TLV list of a START or END packet.
-// Returns 0 on success, -1 on any structural problem or a missing size.
-static int parseTlvs(const unsigned char *tlv, size_t len, unsigned long *fileSize,
-                     const unsigned char **name, size_t *nameLen)
-{
-    size_t pos = 0;
-    bool haveSize = false;
-
-    if (tlv == NULL || fileSize == NULL || name == NULL || nameLen == NULL)
-        return -1;
-
-    *fileSize = 0;
-    *name = NULL;
-    *nameLen = 0;
-
-    while (pos < len)
-    {
-        unsigned char type;
-        unsigned char tlvLen;
-
-        if (pos + 2 > len)
-            return -1;
-
-        type = tlv[pos];
-        tlvLen = tlv[pos + 1];
-        pos += 2;
-
-        if (pos + tlvLen > len)
-            return -1;
-
-        if (type == TLV_TYPE_SIZE)
-        {
-            if (haveSize == true || tlvLen != SIZE_VALUE_LEN)
-                return -1;
-
-            *fileSize = ((unsigned long)tlv[pos] << 24) |
-                        ((unsigned long)tlv[pos + 1] << 16) |
-                        ((unsigned long)tlv[pos + 2] << 8) |
-                        ((unsigned long)tlv[pos + 3]);
-
-            haveSize = true;
-        }
-        else if (type == TLV_TYPE_NAME)
-        {
-            if (tlvLen > MAX_NAME_LEN)
-                return -1;
-
-            *name = tlv + pos;
-            *nameLen = tlvLen;
-        }
-
-        // Unknown types fall through here and are skipped by their length.
-        pos += tlvLen;
-    }
-
-    return haveSize ? 0 : -1;
-}
-
-// Build the START/END metadata block. Returns its length, or 0 on error.
 static size_t buildMetadata(unsigned char *out, size_t capacity,
                             unsigned long fileSize, const char *filename)
 {
     size_t written = 0;
-    size_t nameLen = 0;
+    size_t nameLen = (filename != NULL) ? strlen(filename) : 0;
 
     if (out == NULL || fileSize > MAX_FILE_SIZE)
         return 0;
 
-    if (capacity < 2 + SIZE_VALUE_LEN)
+    // refuse rather than drop the name silently: START and END would still agree
+    if (nameLen > MAX_NAME_LEN)
+        return 0;
+
+    if (capacity < 2 + SIZE_VALUE_LEN + ((nameLen > 0) ? 2 + nameLen : 0))
         return 0;
 
     out[written++] = TLV_TYPE_SIZE;
@@ -173,15 +103,8 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     out[written++] = (unsigned char)((fileSize >> 8) & 0xFF);
     out[written++] = (unsigned char)(fileSize & 0xFF);
 
-    // strlen is used on a file name, never on binary payload.
-    if (filename != NULL)
-        nameLen = strlen(filename);
-
-    if (nameLen > 0 && nameLen <= MAX_NAME_LEN)
+    if (nameLen > 0)
     {
-        if (written + 2 + nameLen > capacity)
-            return 0;
-
         out[written++] = TLV_TYPE_NAME;
         out[written++] = (unsigned char)nameLen;
         memcpy(out + written, filename, nameLen);
@@ -191,27 +114,64 @@ static size_t buildMetadata(unsigned char *out, size_t capacity,
     return written;
 }
 
-////////////////////////////////////////////////
-// Transmitter
-////////////////////////////////////////////////
-
-// Build one packet and hand it to the link layer.
-static int sendPacket(unsigned char type, const unsigned char *payload, size_t payloadLen)
+// Unknown types are skipped by their length, as the specification allows.
+static int parseSize(const unsigned char *tlv, size_t len, unsigned long *fileSize)
 {
-    unsigned char packet[MAX_PAYLOAD_SIZE];
-    size_t packetLen = buildPacket(packet, sizeof(packet), type, payload, payloadLen);
+    size_t pos = 0;
+    bool haveSize = false;
 
-    if (packetLen == 0)
+    if (tlv == NULL || fileSize == NULL)
+        return -1;
+
+    *fileSize = 0;
+
+    while (pos < len)
     {
-        fprintf(stderr, "Payload of %lu bytes does not fit in a packet.\n",
-                (unsigned long)payloadLen);
+        unsigned char type;
+        size_t tlvLen;
+
+        if (pos + 2 > len)
+            return -1;
+
+        type = tlv[pos];
+        tlvLen = tlv[pos + 1];
+        pos += 2;
+
+        if (tlvLen > len - pos)
+            return -1;
+
+        if (type == TLV_TYPE_SIZE)
+        {
+            if (haveSize || tlvLen != SIZE_VALUE_LEN)
+                return -1;
+
+            *fileSize = ((unsigned long)tlv[pos] << 24) |
+                        ((unsigned long)tlv[pos + 1] << 16) |
+                        ((unsigned long)tlv[pos + 2] << 8) |
+                        (unsigned long)tlv[pos + 3];
+
+            haveSize = true;
+        }
+
+        pos += tlvLen;
+    }
+
+    return haveSize ? 0 : -1;
+}
+
+static int sendPacket(const unsigned char *packet, size_t packetLen)
+{
+    if (packet == NULL || packetLen == 0 || packetLen > MAX_PAYLOAD_SIZE)
+    {
+        fprintf(stderr, "A packet of %lu bytes does not fit in an information field.\n",
+                (unsigned long)packetLen);
         return -1;
     }
 
     if (llSend(packet, (int)packetLen) < 0)
     {
-        fprintf(stderr, "Link layer failed to send a type %u packet.\n",
-                (unsigned int)type);
+        fprintf(stderr, "The link layer failed to send a %lu-byte packet.\n",
+                (unsigned long)packetLen);
         return -1;
     }
 
@@ -224,7 +184,7 @@ static void applicationTx(const LinkLayer *params, const char *filename)
 
     if (file == NULL)
     {
-        perror("fopen");
+        perror(filename);
         return;
     }
 
@@ -235,7 +195,7 @@ static void applicationTx(const LinkLayer *params, const char *filename)
         return;
     }
 
-    long fileSize = ftell(file);
+    const long fileSize = ftell(file);
 
     if (fileSize < 0)
     {
@@ -254,64 +214,68 @@ static void applicationTx(const LinkLayer *params, const char *filename)
 
     rewind(file);
 
+    // one metadata block, two packet types
     unsigned char metadata[MAX_METADATA_SIZE];
-    size_t metadataLen = buildMetadata(metadata, sizeof(metadata),
-                                       (unsigned long)fileSize, filename);
+    const size_t metadataLen = buildMetadata(metadata, sizeof(metadata),
+                                             (unsigned long)fileSize, filename);
 
     if (metadataLen == 0)
     {
-        fprintf(stderr, "Could not build the START/END metadata.\n");
+        fprintf(stderr, "Cannot announce %s: the name does not fit in %d characters.\n",
+                filename, MAX_NAME_LEN);
+        fclose(file);
+        return;
+    }
+
+    unsigned char startPacket[MAX_PAYLOAD_SIZE];
+    unsigned char endPacket[MAX_PAYLOAD_SIZE];
+    const size_t startLen = buildPacket(startPacket, sizeof(startPacket),
+                                       APP_C_START, metadata, metadataLen);
+    const size_t endLen = buildPacket(endPacket, sizeof(endPacket),
+                                     APP_C_END, metadata, metadataLen);
+
+    if (startLen == 0 || endLen == 0)
+    {
+        fprintf(stderr, "Could not build the START/END packets.\n");
         fclose(file);
         return;
     }
 
     if (llOpenTx(*params) != 0)
     {
+        fprintf(stderr, "Transfer of %s aborted: connection not established.\n", filename);
         fclose(file);
         return;
     }
 
-    int ok = TRUE;
+    bool ok = (sendPacket(startPacket, startLen) == 0);
 
-    if (sendPacket(APP_C_START, metadata, metadataLen) != 0)
-        ok = FALSE;
+    unsigned char chunk[APP_DATA_CHUNK];
+    size_t readBytes;
 
-    unsigned char chunk[DATA_CHUNK];
-    size_t readBytes = 0;
+    while (ok && (readBytes = fread(chunk, 1, sizeof(chunk), file)) > 0)
+        ok = (sendPacket(chunk, readBytes) == 0);
 
-    while (ok == TRUE && (readBytes = fread(chunk, 1, sizeof(chunk), file)) > 0)
-    {
-        if (sendPacket(APP_C_DATA, chunk, readBytes) != 0)
-            ok = FALSE;
-    }
-
-    if (ok == TRUE && ferror(file))
+    if (ok && ferror(file))
     {
         fprintf(stderr, "Read error on %s.\n", filename);
-        ok = FALSE;
+        ok = false;
     }
 
-    // END carries exactly the metadata START carried.
-    if (ok == TRUE && sendPacket(APP_C_END, metadata, metadataLen) != 0)
-        ok = FALSE;
+    if (ok && sendPacket(endPacket, endLen) != 0)
+        ok = false;
 
     fclose(file);
     llCloseTx();
 
-    if (ok == TRUE)
+    if (ok)
         printf("File %s sent successfully (%ld bytes).\n", filename, fileSize);
     else
         fprintf(stderr, "Transfer of %s failed.\n", filename);
 }
 
-////////////////////////////////////////////////
-// Receiver
-////////////////////////////////////////////////
-
 static void applicationRx(const LinkLayer *params, const char *filename)
 {
-    const int idleBudget = params->nRetransmissions + 1;
-
     if (llOpenRx(*params) != 0)
         return;
 
@@ -327,10 +291,9 @@ static void applicationRx(const LinkLayer *params, const char *filename)
     FILE *file = NULL;
     unsigned long declaredSize = 0;
     unsigned long receivedSize = 0;
-    unsigned char startName[MAX_NAME_LEN + 1];
-    size_t startNameLen = 0;
+    unsigned char startMetadata[MAX_METADATA_SIZE];
+    size_t startMetadataLen = 0;
     bool sawStart = false;
-    bool sawEnd = false;
     int idleCount = 0;
     const char *failure = NULL;
 
@@ -346,9 +309,8 @@ static void applicationRx(const LinkLayer *params, const char *filename)
 
         if (length == 0)
         {
-            // Nothing arrived within one timeout interval. Bounded, so a
-            // vanished transmitter cannot hang the receiver forever.
-            if (++idleCount > idleBudget)
+            // bounded, so a vanished transmitter cannot hang the receiver
+            if (++idleCount > RX_SILENT_ROUNDS)
             {
                 failure = "no data for too long";
                 break;
@@ -369,43 +331,43 @@ static void applicationRx(const LinkLayer *params, const char *filename)
 
         if (type == APP_C_START)
         {
-            unsigned long size = 0;
-            const unsigned char *name = NULL;
-            size_t nameLen = 0;
-
-            if (sawStart == true)
+            if (sawStart)
             {
                 failure = "duplicate START";
                 break;
             }
 
-            if (parseTlvs(packet + 3, payloadLen, &size, &name, &nameLen) != 0)
+            if (payloadLen > sizeof(startMetadata))
+            {
+                failure = "oversized START metadata";
+                break;
+            }
+
+            if (parseSize(packet + 3, payloadLen, &declaredSize) != 0)
             {
                 failure = "malformed START metadata";
                 break;
             }
 
-            declaredSize = size;
-            startNameLen = nameLen;
-
-            if (nameLen > 0)
-                memcpy(startName, name, nameLen);
-
+            // the output path is ours, never the one on the wire
             file = fopen(filename, "wb");
 
             if (file == NULL)
             {
-                perror("fopen");
+                perror(filename);
                 failure = "cannot create the output file";
                 break;
             }
 
+            // verbatim, so END can be compared octet for octet
+            memcpy(startMetadata, packet + 3, payloadLen);
+            startMetadataLen = payloadLen;
             sawStart = true;
             printf("Receiving %s (%lu bytes).\n", filename, declaredSize);
         }
         else if (type == APP_C_DATA)
         {
-            if (sawStart == false || sawEnd == true)
+            if (!sawStart)
             {
                 failure = "DATA outside the START..END window";
                 break;
@@ -429,32 +391,16 @@ static void applicationRx(const LinkLayer *params, const char *filename)
         }
         else if (type == APP_C_END)
         {
-            unsigned long size = 0;
-            const unsigned char *name = NULL;
-            size_t nameLen = 0;
-
-            if (sawStart == false)
+            if (!sawStart)
             {
                 failure = "END before START";
                 break;
             }
 
-            if (parseTlvs(packet + 3, payloadLen, &size, &name, &nameLen) != 0)
+            if (payloadLen != startMetadataLen ||
+                memcmp(packet + 3, startMetadata, startMetadataLen) != 0)
             {
-                failure = "malformed END metadata";
-                break;
-            }
-
-            if (size != declaredSize)
-            {
-                failure = "START and END disagree on the file size";
-                break;
-            }
-
-            if (nameLen != startNameLen ||
-                (nameLen > 0 && memcmp(name, startName, nameLen) != 0))
-            {
-                failure = "START and END disagree on the file name";
+                failure = "END does not repeat START";
                 break;
             }
 
@@ -464,7 +410,6 @@ static void applicationRx(const LinkLayer *params, const char *filename)
                 break;
             }
 
-            sawEnd = true;
             break;
         }
         else
@@ -477,24 +422,28 @@ static void applicationRx(const LinkLayer *params, const char *filename)
     if (file != NULL)
         fclose(file);
 
+    if (failure != NULL && sawStart)
+    {
+        // a truncated file reads as a near-miss in "diff -s ... || exit 0"
+        remove(filename);
+        fprintf(stderr, "Partial file %s removed.\n", filename);
+    }
+
     free(packet);
     llCloseRx();
 
     if (failure != NULL)
         fprintf(stderr, "Transfer failed: %s.\n", failure);
-    else if (sawEnd == true)
-        printf("File %s received successfully (%lu bytes).\n", filename, receivedSize);
     else
-        fprintf(stderr, "Transfer failed: the transfer never reached END.\n");
+        printf("File %s received successfully (%lu bytes).\n", filename, receivedSize);
 }
-
-////////////////////////////////////////////////
-// Entry point
-////////////////////////////////////////////////
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
+    // line-buffered so piped demo transcripts arrive line by line
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     LinkLayer params;
 
     memset(&params, 0, sizeof(params));
@@ -516,5 +465,5 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
     else if (strcmp(role, "rx") == 0)
         applicationRx(&params, filename);
     else
-        printf("Invalid role: %s. Must be 'tx' or 'rx'.\n", role);
+        fprintf(stderr, "Invalid role: %s. Must be 'tx' or 'rx'.\n", role);
 }

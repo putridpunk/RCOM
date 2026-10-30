@@ -1,15 +1,6 @@
-// Serial data link protocol: frame primitives (implementation).
-//
-// Everything here is pure: no serial port, no signals, no mutable state and no
-// output. The only effects are the bytes written to the caller's buffer.
-
 #include "frame.h"
 
 #include <stddef.h>
-
-////////////////////////////////////////////////
-// Control field predicates and extractors
-////////////////////////////////////////////////
 
 bool frameCIsInfo(unsigned char control)
 {
@@ -33,8 +24,7 @@ unsigned char frameCGetNs(unsigned char control)
 
 unsigned char frameCGetNr(unsigned char control)
 {
-    // 0xAA/0xAB and 0x54/0x55 differ in bit 0 only. Bit 7 is always set for
-    // RR and clear for REJ, so using it here would return a constant.
+    // bit 0: bit 7 is constant within RR and within REJ
     return (unsigned char)(control & 0x01);
 }
 
@@ -65,10 +55,6 @@ const char *frameControlName(unsigned char control)
     }
 }
 
-////////////////////////////////////////////////
-// Block check characters
-////////////////////////////////////////////////
-
 unsigned char frameBcc1(unsigned char address, unsigned char control)
 {
     return (unsigned char)(address ^ control);
@@ -87,10 +73,6 @@ unsigned char frameBcc2(const unsigned char *data, size_t dataSize)
     return bcc;
 }
 
-////////////////////////////////////////////////
-// Byte stuffing
-////////////////////////////////////////////////
-
 int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_t outCapacity)
 {
     size_t written = 0;
@@ -104,8 +86,7 @@ int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_
     if (inSize == 0)
         return 0;
 
-    // The exact size is checked before a single byte is written, so a failure
-    // never leaves a half-stuffed buffer behind.
+    // exact size checked up front, so a failure leaves "out" untouched
     size_t needed = 0;
 
     for (size_t i = 0; i < inSize; i++)
@@ -137,19 +118,13 @@ int frameStuff(const unsigned char *in, size_t inSize, unsigned char *out, size_
     return (int)written;
 }
 
-////////////////////////////////////////////////
-// Frame construction
-////////////////////////////////////////////////
-
 int frameBuildSupervision(unsigned char *out, size_t outCapacity,
                           unsigned char address, unsigned char control)
 {
     if (out == NULL || outCapacity < SUPERVISION_FRAME_SIZE)
         return -1;
 
-    // For every control value in use the BCC1 result is never 0x7E or 0x7D
-    // (tests/selftest.c asserts it over the whole A x C table), so the header
-    // of a supervision frame never needs stuffing.
+    // no legal BCC1 is 0x7E or 0x7D (asserted in selftest), so no stuffing here
     out[0] = FRAME_FLAG;
     out[1] = address;
     out[2] = control;
@@ -172,8 +147,7 @@ int frameBuildInfo(unsigned char *out, size_t outCapacity,
     if (packetLen > MAX_PAYLOAD_SIZE)
         return -1;
 
-    // Checked once, and only once: with MAX_FRAME_SIZE available the stuffing
-    // calls below cannot fail, so "out" is written whole or not at all.
+    // MAX_FRAME_SIZE covers the worst case, so the stuffing calls cannot fail
     if (outCapacity < MAX_FRAME_SIZE)
         return -1;
 
@@ -186,7 +160,6 @@ int frameBuildInfo(unsigned char *out, size_t outCapacity,
     out[written++] = control;
     out[written++] = frameBcc1(address, control);
 
-    // Both checksums were computed on the un-stuffed bytes.
     written += (size_t)frameStuff(packet, packetLen, out + written, outCapacity - written);
     written += (size_t)frameStuff(&bcc2, 1, out + written, outCapacity - written);
 
