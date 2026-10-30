@@ -1,17 +1,12 @@
-// Link layer implementation.
+// what actually goes on the wire, before stuffing:
+//   supervision: F | A | C | BCC1 | F
+//   information: F | A | C | BCC1 | app packet | BCC2 | F
 //
-// On the wire, before stuffing:
-//   supervision : F | A | C | BCC1 | F
-//   information : F | A | C | BCC1 | application packet | BCC2 | F
+// stop and wait. Ns goes 0,1,0,1... and an RR or REJ carries Nr = the frame rx
+// wants next. tx only moves Ns when an RR comes back with a different Nr, so a
+// retry sends the same number and the same bytes.
 //
-// Only the transmitter sends information frames. Stop-and-Wait with Ns
-// alternating 0/1; an RR or REJ carries Nr, the frame the receiver expects next.
-// Ns moves only on an RR carrying a different Nr, so a retry repeats the same
-// number and the same bytes.
-//
-// Every supervision exchange in here is the same three steps: send, arm the
-// alarm, wait for the reply. That's sendAndWait() and waitAck() below. The rest
-// of the file is a few lines wrapped around them.
+// TODO: efficiency numbers in statsPrint are rough, redo for the report
 
 #include "link_layer.h"
 #include "serial_port.h"
@@ -26,8 +21,6 @@
 #include <string.h>
 #include <time.h>
 
-// ---- Connection state ----
-
 typedef enum
 {
     ROLE_NONE = 0,
@@ -35,39 +28,35 @@ typedef enum
     ROLE_RX
 } LinkRole;
 
-// Outcome of one attempt at reading a frame from the serial port.
+// what came out of one attempt at reading a frame
 typedef enum
 {
-    RX_OK_SUPERVISION, // a complete, valid supervision frame
-    RX_OK_DATA,        // a complete information frame with a valid BCC2
-    RX_IGNORED,        // malformed, truncated or oversized frame; discarded
-    RX_BAD_BCC2,       // information frame whose data field failed its check
-    RX_TIMEOUT,        // the read was interrupted by our own alarm
-    RX_IO_ERROR        // unrecoverable error on the serial port
+    RX_OK_SUPERVISION, // got a supervision frame
+    RX_OK_DATA,        // got an I frame and its BCC2 checked out
+    RX_IGNORED,        // malformed/truncated/too long, threw it away
+    RX_BAD_BCC2,       // I frame but the data field failed its check
+    RX_TIMEOUT,        // our alarm went off
+    RX_IO_ERROR        // port died
 } RxResult;
 
-// States of the frame reception machine.
 typedef enum
 {
-    ST_HUNT_FLAG,          // look for the opening delimiter
-    ST_READ_A,             // address field
-    ST_READ_C,             // control field
-    ST_READ_BCC1,          // header check character
-    ST_READ_SUPERVISION_F, // closing flag of a supervision frame
-    ST_READ_DATA           // de-stuffed data field, up to the closing flag
+    ST_HUNT_FLAG,          // looking for the opening delimiter
+    ST_READ_A,
+    ST_READ_C,
+    ST_READ_BCC1,
+    ST_READ_SUPERVISION_F, // waiting for the closing flag
+    ST_READ_DATA           // unstuffing until the closing flag
 } RxState;
 
-// Verdict on an information frame that has just been transmitted.
 typedef enum
 {
-    ACKED,       // the receiver took it: advance Ns
-    REJECTED,    // the receiver wants it again: retransmit now
-    ACK_TIMEOUT, // no reply inside the window: retransmit
-    ACK_ERROR    // the serial port failed
+    ACKED,       // rx took it, bump Ns
+    REJECTED,    // rx wants it again
+    ACK_TIMEOUT, // nothing came back
+    ACK_ERROR    // port died
 } AckResult;
 
-// Counters for one connection, which is why they live here rather than in the
-// pure frame module.
 typedef struct
 {
     unsigned long setSent;
@@ -91,9 +80,8 @@ typedef struct
     unsigned long duplicateFrames;
     unsigned long addressErrors;
 
-    // Payload counted once per packet queued, not once per retry, so
-    // payloadBytesSent matches the number of file bytes handed to the link
-    // layer.
+    // counted once when the packet is queued, not once per retry, so this
+    // matches the number of file bytes we handed to the link layer
     unsigned long payloadBytesSent;
     unsigned long payloadBytesReceived;
 
@@ -106,11 +94,10 @@ static LinkStats linkStats;
 static LinkRole currentRole = ROLE_NONE;
 static LinkLayer linkParams;
 
-static uint8_t txNs = 0;       // Ns of the next information frame (Tx side)
-static uint8_t rxExpected = 0; // next Ns the receiver will deliver (Rx side)
+static uint8_t txNs = 0;       // Ns of the next I frame (tx side)
+static uint8_t rxExpected = 0; // next Ns rx will pass up (rx side)
 
-// De-stuffed body of the frame in progress: the application packet plus its
-// trailing BCC2, which is the one extra byte.
+// unstuffed body of the frame we're reading: the packet plus its BCC2
 static unsigned char rxBody[MAX_PAYLOAD_SIZE + FRAME_BCC2_SIZE];
 
 static int writeAll(const unsigned char *buf, size_t length)
@@ -128,6 +115,8 @@ static int writeAll(const unsigned char *buf, size_t length)
 
         if (result < 0)
         {
+            // EINTR = our alarm went off mid write, doesn't mean the write
+            // failed, just do it again
             if (errno == EINTR)
                 continue;
 
@@ -147,8 +136,6 @@ static int writeAll(const unsigned char *buf, size_t length)
     return 0;
 }
 
-// ---- Statistics ----
-
 static void statsReset(void)
 {
     memset(&linkStats, 0, sizeof(linkStats));
@@ -156,6 +143,8 @@ static void statsReset(void)
     linkStats.started = (clock_gettime(CLOCK_MONOTONIC, &linkStats.startTime) == 0);
 }
 
+// TODO: these two are basically the same function twice, could do it with a
+// table but it's not worth the bother at this point
 static void statsCountSupervisionSent(unsigned char control)
 {
     switch (control)
@@ -252,8 +241,7 @@ static void statsPrint(void)
     {
         printf("  throughput ............. %8.1f B/s\n", payload / elapsed);
 
-        // S = R/C for the efficiency plot in the report. Ten bits per octet go
-        // on the wire (8-N-1), so R in bit/s is payload * 10 / elapsed.
+        // efficiency point (report)
         if (linkParams.baudRate > 0)
             printf("  efficiency ............. %8.2f %%\n",
                    100.0 * payload * 10.0 / (elapsed * (double)linkParams.baudRate));
@@ -262,11 +250,8 @@ static void statsPrint(void)
     printf("-----------------------------\n");
 }
 
-// ---- Supervision frames ----
-
-// A command carries our own address, a reply carries the address of the command
-// it answers. Only two frames we send are replies: the transmitter's UA and the
-// receiver's DISC.
+// commands carry our own address, replies carry the peer's. the only two we
+// send that are replies: tx's UA and rx's DISC
 static unsigned char supervisionAddr(unsigned char control)
 {
     if (currentRole == ROLE_TX)
@@ -278,7 +263,6 @@ static unsigned char supervisionAddr(unsigned char control)
     return A_TX;
 }
 
-// Returns 0 on success, -1 on failure.
 static int sendSupervision(unsigned char control)
 {
     unsigned char frame[SUPERVISION_FRAME_SIZE];
@@ -295,8 +279,8 @@ static int sendSupervision(unsigned char control)
     return 0;
 }
 
-// An RR, a REJ or a repeated UA. If the write fails we say so and carry on: the
-// peer's timeout is what recovers, not ours.
+// best effort, if the write fails we just say so and carry on. the peer's
+// timeout is what recovers, not ours
 static void sendReply(unsigned char control)
 {
     if (sendSupervision(control) != 0)
@@ -304,10 +288,8 @@ static void sendReply(unsigned char control)
                 frameControlName(control));
 }
 
-// ---- Frame reception ----
-
-// Which (address, control) pairs this role is allowed to accept. Anything else
-// belongs to the other direction, or is noise that happened to pass BCC1.
+// which (A,C) pairs this role accepts. anything else is either meant for the
+// other direction or noise that happened to pass BCC1
 static bool addressAccepted(unsigned char address, unsigned char control)
 {
     if (currentRole == ROLE_RX)
@@ -316,7 +298,7 @@ static bool addressAccepted(unsigned char address, unsigned char control)
             return control == C_SET || control == C_DISC ||
                    control == C_I0 || control == C_I1;
 
-        // The UA that answers the DISC the receiver sends during close.
+        // the UA that answers the DISC we send when closing
         if (address == A_RX)
             return control == C_UA;
 
@@ -329,7 +311,7 @@ static bool addressAccepted(unsigned char address, unsigned char control)
             return control == C_UA || control == C_RR0 || control == C_RR1 ||
                    control == C_REJ0 || control == C_REJ1;
 
-        // The DISC the receiver answers with, and its retransmissions.
+        // the DISC rx answers with, and its retransmissions
         if (address == A_RX)
             return control == C_DISC;
 
@@ -339,16 +321,12 @@ static bool addressAccepted(unsigned char address, unsigned char control)
     return false;
 }
 
-// Read one frame, byte by byte, and classify it.
+// reads one frame byte by byte and says what it was. hunt for the flag, take A,
+// C and BCC1, then C decides the rest: supervision ends at the next flag, an I
+// frame has an unstuffed data field, then BCC2, then the flag.
 //
-// Hunt for the opening flag, then take A, C and BCC1. The filtering happens at
-// BCC1 because C decides what follows: a supervision frame ends at the next
-// flag, an information frame has a de-stuffed data field, then a BCC2, then the
-// flag.
-//
-// packet and *packetLen are filled on RX_OK_DATA only. On RX_BAD_BCC2 the
-// payload is dropped but *controlOut still gets the control field, so the caller
-// can pick the right REJ.
+// packet and *packetLen only get filled on RX_OK_DATA. on RX_BAD_BCC2 we drop
+// the payload but still hand back C so the caller knows which REJ to send
 static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                             int *packetLen, unsigned char *controlOut)
 {
@@ -357,15 +335,15 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
     unsigned char address = 0;
     unsigned char control = 0;
 
-    size_t filled = 0;     // de-stuffed bytes sitting in rxBody
-    bool overflow = false; // the data field didn't fit in rxBody
-    bool escape = false;   // the previous byte was the escape octet
+    size_t filled = 0;     // unstuffed bytes sitting in rxBody
+    bool overflow = false; // data field didn't fit in rxBody
+    bool escape = false;   // the byte before was the escape
 
     if (packet == NULL || packetLen == NULL || controlOut == NULL)
         return RX_IO_ERROR;
 
-    // A smaller buffer turns full-size frames into RX_IGNORED, which at the
-    // receiver looks the same as a dead line.
+    // if the buffer is too small for a full frame we'd silently turn everything
+    // into RX_IGNORED and it'd look like a dead line
     if (packetCapacity < MAX_PAYLOAD_SIZE)
         return RX_IO_ERROR;
 
@@ -381,9 +359,9 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
         {
             if (errno == EINTR)
             {
-                // Our handler is the only thing that clears the flag, so a
-                // cleared flag means our own alarm fired. Anything else
-                // interrupted us and we keep reading inside the same window.
+                // our handler is the only thing that clears the flag, so a
+                // cleared flag means it was our alarm. anything else
+                // interrupted us, keep reading in the same window
                 if (!isAlarmActive())
                     return RX_TIMEOUT;
 
@@ -394,9 +372,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
             return RX_IO_ERROR;
         }
 
-        // serial_port.c blocks with VMIN = 1, so a zero-length read is end of
-        // file, not "nothing yet". Spinning on it would pin the CPU until
-        // someone kills the process.
+        // serial_port.c blocks with VMIN=1 so 0 bytes here is EOF
         if (result == 0)
         {
             fprintf(stderr, "Serial port reported end of file.\n");
@@ -411,7 +387,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
             break;
 
         case ST_READ_A:
-            // Several opening flags in a row are legal.
+            // a bunch of flags in a row is legal, keep skipping
             if (byte == FRAME_FLAG)
                 break;
 
@@ -420,7 +396,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
             break;
 
         case ST_READ_C:
-            // A flag where the control field should be opens a new frame.
+            // flag where C should be, so this is a new frame
             if (byte == FRAME_FLAG)
             {
                 state = ST_READ_A;
@@ -440,7 +416,8 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
 
             if (byte != frameBcc1(address, control))
             {
-                // Damaged header: drop it silently, the peer's timeout recovers.
+                // header is damaged, drop it quietly. the peer's timeout sorts
+                // it out
                 linkStats.bcc1Errors++;
                 state = ST_HUNT_FLAG;
                 break;
@@ -469,7 +446,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
         case ST_READ_SUPERVISION_F:
             if (byte != FRAME_FLAG)
             {
-                // Malformed supervision frame: resync on the next flag.
+                // not a flag where it should be, give up and resync
                 state = ST_HUNT_FLAG;
                 break;
             }
@@ -489,7 +466,7 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                     byte = FRAME_ESCAPE;
                 else
                 {
-                    // 0x7D with nothing valid after it.
+                    // 7D followed by something that isn't a valid escape
                     state = ST_HUNT_FLAG;
                     break;
                 }
@@ -516,12 +493,12 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
                 break;
             }
 
-            // Closing flag. The last de-stuffed byte is the BCC2.
+            // closing flag. last unstuffed byte is the BCC2
             state = ST_HUNT_FLAG;
 
             if (overflow || filled < 1)
             {
-                // Oversized, or a header with no BCC2 at all.
+                // too long, or a header with no BCC2 at all
                 return RX_IGNORED;
             }
 
@@ -543,17 +520,13 @@ static RxResult rxReadFrame(unsigned char *packet, size_t packetCapacity,
     }
 }
 
-// ---- Retry primitives ----
-
-// Wait for a supervision frame inside the current alarm window.
+// waits for a supervision frame inside the alarm window we already armed.
+// 1 + the control field, 0 if the alarm fired first, -1 on an I/O error.
 //
-// Returns 1 with the control field, 0 if the alarm fired first, -1 on an I/O
-// error.
-//
-// Information frames aren't what the callers are after, with one exception: at
-// the receiver a duplicate still has to be acknowledged. Dropping it burns the
-// sender's whole retry budget on data that already arrived. That is exactly
-// what happens to a retransmitted END when its RR goes missing.
+// I frames aren't what the callers want here, except at rx where a duplicate
+// still needs an RR. if we dropped it, tx would burn its whole retry budget on
+// data that already arrived, and that's what happens to a retransmitted END when
+// its RR gets lost
 static int waitControl(unsigned char *controlOut)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
@@ -576,35 +549,33 @@ static int waitControl(unsigned char *controlOut)
             return 1;
         }
 
-        // Everything below is an information frame. The transmitter never
-        // accepts data, so this branch is the receiver's business only.
+        // everything from here down is an I frame. tx never accepts data so
+        // this is rx's problem only
         if (currentRole != ROLE_RX)
             continue;
 
         if (frameCGetNs(control) != rxExpected)
         {
-            // Duplicate. Throw the payload away whatever its BCC2 says, and
-            // repeat the RR for the frame we're still expecting.
+            // duplicate, bin the payload whatever its BCC2 says and repeat the
+            // RR for the one we're still waiting for
             sendReply(C_RR(rxExpected));
             continue;
         }
 
         if (result == RX_BAD_BCC2)
         {
-            // New frame with a damaged payload: ask for it again.
+            // new frame but the payload is damaged, ask again
             sendReply(C_REJ(rxExpected));
             continue;
         }
 
-        // A new, undamaged frame is left alone here. Only llReceive() hands data
-        // to the application. The transmitter's timeout brings the frame back,
-        // and the close handshake sees the repeat.
+        // new and undamaged, leave it alone here. only llReceive() passes data
+        // up to the app
     }
 }
 
-// Send a supervision frame and wait for the reply that answers it, retrying up
-// to nRetransmissions extra times. Returns 0 once the expected reply arrives,
-// -1 when every attempt ran out.
+// send a supervision frame and wait for the reply that answers it, with up to
+// nRetransmissions extra goes. 0 once we get it, -1 when we've run out
 static int sendAndWait(unsigned char command, unsigned char expected)
 {
     const int attempts = linkParams.nRetransmissions + 1;
@@ -622,8 +593,8 @@ static int sendAndWait(unsigned char command, unsigned char expected)
 
         startAlarm((unsigned)linkParams.timeout);
 
-        // Anything that isn't the expected reply gets ignored inside the same
-        // window: a stale RR, a leftover UA, a repeated DISC.
+        // ignore anything that isn't the reply we asked for, in the same
+        // window. stale RR, leftover UA, repeated DISC, all the same to us
         do
         {
             result = waitControl(&control);
@@ -645,7 +616,7 @@ static int sendAndWait(unsigned char command, unsigned char expected)
     return -1;
 }
 
-// Verdict on the information frame just sent.
+// what happened to the I frame we just sent
 static AckResult waitAck(unsigned char ns)
 {
     for (;;)
@@ -662,10 +633,9 @@ static AckResult waitAck(unsigned char ns)
             return ACK_TIMEOUT;
         }
 
-        // Modulo-2 numbering turns both cases into one comparison:
-        //   RR with Nr != Ns  -> the receiver moved on, frame accepted
-        //   REJ with Nr == Ns -> the receiver wants it again
-        // Anything else is stale and doesn't end the window.
+        // RR with Nr != Ns means rx moved on and took it. REJ with Nr == Ns
+        // means send it again. anything else is stale and doesn't end the
+        // window
         if (frameCIsRR(control))
         {
             if (frameCGetNr(control) != ns)
@@ -682,13 +652,11 @@ static AckResult waitAck(unsigned char ns)
             continue;
         }
 
-        // A leftover UA, or a DISC we didn't ask for. Keep listening.
+        // leftover UA or a DISC we didn't ask for
     }
 }
 
-// ---- LLOPEN ----
-
-// Open the port as transmitter and run the SET/UA handshake.
+// open the port as tx and do the SET/UA handshake
 int llOpenTx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -720,8 +688,8 @@ int llOpenTx(LinkLayer llParameters)
     stopAlarm();
     statsReset();
 
-    // nRetransmissions counts retries after the first try, so nTries = 3 means
-    // at most four SET frames on the wire.
+    // nTries counts retries AFTER the first go, so nTries=3 means at most 4 SET
+    // frames on the wire
     if (sendAndWait(C_SET, C_UA) != 0)
     {
         closeSerialPort();
@@ -735,11 +703,9 @@ int llOpenTx(LinkLayer llParameters)
     return 0;
 }
 
-// Open the port as receiver and wait for SET.
-//
-// Bounded by requirement: (nRetransmissions + 1) rounds. With main.c's values
-// that's four rounds of four seconds, so the transmitter has a sixteen second
-// window to show up after we start.
+// open the port as rx and wait for SET. the spec says bounded by
+// nRetransmissions+1 rounds, with main.c that's 4 rounds of 4s so tx has 16s
+// from when we start
 int llOpenRx(LinkLayer llParameters)
 {
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -750,8 +716,8 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened (receiver).\n", llParameters.serialPort);
 
-    // Also installed here: the close handshake arms an alarm in both roles, and
-    // a handler has to exist before the first alarm(2) call.
+    // needed here too, the close handshake arms an alarm on both sides and the
+    // handler has to exist before the first alarm(2)
     if (setupAlarmHandler() == -1)
     {
         perror("setupAlarmHandler");
@@ -812,10 +778,8 @@ int llOpenRx(LinkLayer llParameters)
     return -1;
 }
 
-// ---- LLSEND ----
-
-// Send one packet inside an information frame and wait for the acknowledgement.
-// Returns bufSize on success, -1 on error or when the retries run out.
+// put one packet in an I frame and wait for the ack. bufSize on success, -1 on
+// error or when we've used up the retries
 int llSend(const unsigned char *buf, int bufSize)
 {
     if (buf == NULL || bufSize <= 0 || bufSize > MAX_PAYLOAD_SIZE)
@@ -860,19 +824,16 @@ int llSend(const unsigned char *buf, int bufSize)
         if (ack == ACK_ERROR)
             return -1;
 
-        // ACK_TIMEOUT and REJECTED both land here: same number, same bytes.
+        // timeout or a REJ, both end up back here with the same Ns so we just
+        // rebuild and send it again
     }
 
     fprintf(stderr, "llSend: no acknowledgement after %d attempts.\n", attempts);
     return -1;
 }
 
-// ---- LLRECEIVE ----
-
-// Hand one packet to the application.
-//
-// Returns the packet length, or 0 if nothing arrived within one timeout interval
-// (call again), or -1 on an unrecoverable error.
+// pass one packet up to the app. returns the length, or 0 if nothing arrived in
+// one timeout (call again), or -1 on a real error
 int llReceive(unsigned char *buf)
 {
     if (buf == NULL || currentRole != ROLE_RX || linkParams.timeout <= 0)
@@ -900,19 +861,17 @@ int llReceive(unsigned char *buf)
         {
             if (control == C_SET)
             {
-                // The transmitter missed our UA and is repeating SET. Sending it
-                // again is harmless. This is not a duplicate information frame,
-                // so duplicateFrames stays put; the repeat shows up as a second
-                // "SET received" instead.
+                // tx missed our UA, send it again. harmless, and its not a
+                // duplicate I frame so duplicateFrames stays where it is
                 sendReply(C_UA);
                 continue;
             }
 
             if (control == C_DISC)
             {
-                // The transmitter gave up mid-transfer. Stop receiving and let
-                // the application run the close handshake, which answers the
-                // DISC it sends again.
+                // tx gave up half way through. stop receiving and let the app
+                // run the close handshake, which will answer the DISC it sends
+                // again
                 fprintf(stderr, "DISC received during the transfer; "
                                 "the transmitter has aborted.\n");
                 return -1;
@@ -921,11 +880,9 @@ int llReceive(unsigned char *buf)
             continue;
         }
 
-        // An information frame, possibly with a damaged data field.
+        // an I frame, maybe with a damaged payload
         if (frameCGetNs(control) != rxExpected)
         {
-            // Duplicate. Drop the payload whatever its BCC2 says, and repeat the
-            // RR for the frame we're still expecting.
             linkStats.duplicateFrames++;
             sendReply(C_RR(rxExpected));
             continue;
@@ -933,8 +890,8 @@ int llReceive(unsigned char *buf)
 
         if (result == RX_BAD_BCC2)
         {
-            // New frame, damaged payload: ask for it again, expectation
-            // unchanged.
+            // new frame, bad payload, ask for it again. expectation doesn't
+            // move
             sendReply(C_REJ(rxExpected));
             continue;
         }
@@ -949,9 +906,7 @@ int llReceive(unsigned char *buf)
     }
 }
 
-// ---- LLCLOSE ----
-
-// Close the transmitter: DISC -> DISC -> UA.
+// close tx: DISC -> DISC -> UA
 int llCloseTx(void)
 {
     if (currentRole != ROLE_TX || linkParams.timeout <= 0)
@@ -968,15 +923,14 @@ int llCloseTx(void)
     }
     else if (sendSupervision(C_UA) != 0)
     {
-        // The UA carries the address of the DISC we just received.
+        // the UA carries the address of the DISC we just got
         status = -1;
     }
     else
     {
-        // Linger for up to (nRetransmissions + 1) windows. If our UA was lost
-        // the receiver repeats its DISC when its own timeout expires, and every
-        // repeat needs an answer. The first quiet window ends this, so the
-        // normal case costs exactly one interval.
+        // hang around for up to nTries+1 windows. if our UA got lost rx will
+        // repeat its DISC when its own timeout expires and each repeat needs an
+        // answer. first quiet window ends this so normally it's just one
         unsigned char control = 0;
         const int windows = linkParams.nRetransmissions + 1;
 
@@ -1004,7 +958,7 @@ int llCloseTx(void)
     return status;
 }
 
-// Close the receiver: wait for DISC, answer DISC, wait for UA.
+// close rx: wait for DISC, answer DISC, wait for UA
 int llCloseRx(void)
 {
     if (currentRole != ROLE_RX || linkParams.timeout <= 0)
@@ -1016,9 +970,9 @@ int llCloseRx(void)
 
     stopAlarm();
 
-    // 1. Wait for the transmitter's DISC. waitControl() keeps acknowledging a
-    //    retransmitted END, so a lost RR for the last packet costs the
-    //    transmitter one retry instead of its whole budget.
+    // 1. wait for tx's DISC. waitControl keeps acking a retransmitted END, so a
+    //    lost RR for the last packet only costs tx one retry instead of its
+    //    whole budget
     for (int round = 1; round <= rounds; round++)
     {
         unsigned char control = 0;
@@ -1053,7 +1007,7 @@ int llCloseRx(void)
     if (status == 0 && !gotDisc)
         fprintf(stderr, "Close handshake failed: no DISC from the transmitter.\n");
 
-    // 2. Answer with DISC (A = 0x01) and wait for the transmitter's UA.
+    // 2. answer with DISC (A = 0x01) and wait for tx's UA
     if (status == 0 && gotDisc && sendAndWait(C_DISC, C_UA) != 0)
     {
         fprintf(stderr, "Close handshake failed: no UA from the transmitter.\n");
