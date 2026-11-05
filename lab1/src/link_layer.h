@@ -1,5 +1,3 @@
-// RCOM 2026/2027
-//
 // Link layer header.
 // DO NOT CHANGE THIS FILE
 
