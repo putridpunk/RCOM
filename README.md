@@ -1,135 +1,135 @@
-# RCOM — Redes de Computadores
+# RCOM — Computer Networks
 
-Trabalho da cadeira de **Redes de Computadores** do 3.º ano da **L.EIC** (FEUP).
+Course project for **Computer Networks** in the 3rd year of **L.EIC** at FEUP.
 
-O objetivo é implementar uma transferência de ficheiros fiável sobre uma ligação
-série, usando uma API de porta série fornecida: a **camada de ligação** (framing,
-controlo de erros, retransmissões) e um **protocolo de aplicação** simples
-(pacotes de controlo e de dados) por cima dela.
+The aim is to implement reliable file transfer over a serial link using a
+provided serial-port API: the **link layer** (framing, error control,
+retransmissions) and a simple **application protocol** (control and data
+packets) built on top of it.
 
-> O código usa `termios`, `alarm(2)`/`SIGALRM` e `socat`, por isso corre apenas em
-> Linux, macOS ou WSL — não em Windows nativo.
+> The code uses `termios`, `alarm(2)`/`SIGALRM` and `socat`, so it only runs on
+> Linux, macOS or WSL — not on native Windows.
 
-## Estrutura do repositório
+## Repository structure
 
 ```
 .
 ├── README.md
 └── lab1/
-    ├── src/            # implementação (camada de ligação + aplicação)
-    │   ├── main.c             # parsing dos argumentos (não alterar)
-    │   ├── link_layer.c/.h    # protocolo de ligação: SET/UA, I, RR/REJ, DISC
-    │   ├── frame.c/.h         # helpers puros de framing, BCC e byte stuffing
-    │   ├── application_layer.c/.h  # pacotes START/DATA/END e TLVs
-    │   ├── serial_port.c/.h   # API da porta série (não alterar)
+    ├── src/            # implementation (link layer + application)
+    │   ├── main.c             # argument parsing (do not change)
+    │   ├── link_layer.c/.h    # link protocol: SET/UA, I, RR/REJ, DISC
+    │   ├── frame.c/.h         # pure framing, BCC and byte-stuffing helpers
+    │   ├── application_layer.c/.h  # START/DATA/END packets and TLVs
+    │   ├── serial_port.c/.h   # serial-port API (do not change)
     │   └── alarm_sigaction.c/.h    # timeouts via alarm(2)
-    ├── cable/cable.c   # cabo virtual (não alterar)
-    ├── tests/selftest.c # testes dos helpers de framing
-    ├── Makefile        # build e targets de execução (não alterar)
-    ├── penguin.gif     # ficheiro de exemplo
-    └── README.txt      # enunciado original do laboratório
+    ├── cable/cable.c   # virtual cable (do not change)
+    ├── tests/selftest.c # tests for the framing helpers
+    ├── Makefile        # build and run targets (do not change)
+    ├── penguin.gif     # sample file
+    └── README.txt      # original lab assignment
 ```
 
-## Protocolo implementado
+## Implemented protocol
 
-### Camada de ligação (`src/link_layer.c`)
+### Link layer (`src/link_layer.c`)
 
-Framing do tipo HDLC, com **stop-and-wait** e números de sequência alternados
+HDLC-style framing with **stop-and-wait** and alternating sequence numbers
 (0/1):
 
 ```
-supervisão: F | A | C | BCC1 | F
-informação: F | A | C | BCC1 | dados | BCC2 | F
+supervisory: F | A | C | BCC1 | F
+information: F | A | C | BCC1 | data | BCC2 | F
 ```
 
-- `F = 0x7E`, `A` = endereço (`0x03` comando, `0x01` resposta),
-  `BCC1 = A ^ C` (paridade par).
-- `BCC2` é a paridade par de todos os bytes de dados.
-- **Byte stuffing** em tudo o que vem depois do `BCC1`:
-  `0x7E → 0x7D 0x5E` e `0x7D → 0x7D 0x5D`.
-- Estabelecimento de ligação com **SET/UA**, terminação com **DISC/UA**,
-  ambas com até `nRetransmissions + 1` tentativas e timeout por `SIGALRM`.
-- Dados confirmados com **RR** e pedidos de reenvio com **REJ**; tramas
-  duplicadas são detetadas pelo `Ns` e ignoradas.
-- Erros de `BCC1`/`BCC2`, timeouts e reenvios são contabilizados e impressos no
-  fim da transferência (estatísticas, throughput e eficiência).
+- `F = 0x7E`, `A` = address (`0x03` command, `0x01` reply), and
+  `BCC1 = A ^ C` (even parity).
+- `BCC2` is the even parity of all data bytes.
+- **Byte stuffing** applies to everything after `BCC1`:
+  `0x7E → 0x7D 0x5E` and `0x7D → 0x7D 0x5D`.
+- Connection setup uses **SET/UA** and teardown uses **DISC/UA**, each with up
+  to `nRetransmissions + 1` attempts and a timeout driven by `SIGALRM`.
+- Data is acknowledged with **RR** and retransmission is requested with **REJ**;
+  duplicate frames are detected through `Ns` and discarded.
+- `BCC1`/`BCC2` errors, timeouts and retransmissions are counted and printed at
+  the end of the transfer (statistics, throughput and efficiency).
 
-### Camada de aplicação (`src/application_layer.c`)
+### Application layer (`src/application_layer.c`)
 
-Pacotes `C | L2 | L1 | payload`, em que o tamanho do payload é
+Packets are `C | L2 | L1 | payload`, where the payload size is
 `256 * L2 + L1`:
 
-| Tipo | `C` | Conteúdo |
+| Type | `C` | Contents |
 | ---- | --- | -------- |
-| START | `1` | TLVs de metadados |
-| DATA | `2` | `APP_DATA_CHUNK` bytes de ficheiro (997 por omissão) |
-| END | `3` | os mesmos TLVs do START |
+| START | `1` | metadata TLVs |
+| DATA | `2` | `APP_DATA_CHUNK` file bytes (997 by default) |
+| END | `3` | the same TLVs as START |
 
-TLVs suportados:
+Supported TLVs:
 
-| Tipo | Nome | Formato |
-| ---- | ---- | ------- |
-| `0` | tamanho do ficheiro | 4 bytes, big endian |
-| `1` | nome do ficheiro | 0–255 bytes, sem `\0` |
+| Type | Name | Format |
+| ---- | ---- | ------ |
+| `0` | file size | 4 bytes, big endian |
+| `1` | file name | 0–255 bytes, no `\0` |
 
-O recetor valida os metadados, escreve os dados à medida que chegam e confirma
-que o tamanho recebido corresponde ao anunciado. `MAX_PAYLOAD_SIZE` é 1000
-bytes; o tamanho dos blocos de dados pode ser alterado em tempo de compilação
-com `-DAPP_DATA_CHUNK=...` (usado para medir eficiência).
+The receiver validates the metadata, writes data as it arrives and confirms
+that the received size matches the announced one. `MAX_PAYLOAD_SIZE` is 1000
+bytes; the data chunk size can be changed at compile time with
+`-DAPP_DATA_CHUNK=...` (used for efficiency measurements).
 
-## Compilar
+## Building
 
 ```bash
 cd lab1
-make            # constrói bin/main e bin/cable
+make            # builds bin/main and bin/cable
 ```
 
-## Correr
+## Running
 
-É necessário o [`socat`](https://linux.die.net/man/1/socat) para o cabo virtual.
+[`socat`](https://linux.die.net/man/1/socat) is required for the virtual cable.
 
 ```bash
-# 1. Cabo virtual (precisa de root)
-make run_cable          # ou: sudo ./bin/cable
+# 1. Virtual cable (requires root)
+make run_cable          # or: sudo ./bin/cable
 
-# 2. Recetor
+# 2. Receiver
 make run_rx             # ./bin/main /tmp/ttyS11 9600 rx penguin-received.gif
 
-# 3. Transmissor
+# 3. Transmitter
 make run_tx             # ./bin/main /tmp/ttyS10 9600 tx penguin.gif
 
-# 4. Verificar integridade
+# 4. Check integrity
 make check_files        # diff -s penguin.gif penguin-received.gif
 ```
 
-Uso direto do executável:
+Running the executable directly:
 
 ```
-./bin/main <porta> <baudrate> <tx|rx> <ficheiro>
+./bin/main <port> <baudrate> <tx|rx> <file>
 ```
 
-`nTries = 3` e `timeout = 4 s` estão definidos em `src/main.c`; os baudrates
-suportados são 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600 e 115200.
+`nTries = 3` and `timeout = 4 s` are defined in `src/main.c`; the supported baud
+rates are 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600 and 115200.
 
-### Testar com erros
+### Testing with errors
 
-Com o cabo virtual a correr, introduza comandos no seu terminal:
+With the virtual cable running, enter commands in its terminal:
 
 ```
-off              # corta a ligação
-on               # volta a ligar
-ber 1e-4         # injeta ruído (bit error rate)
-prop 1000        # atraso de propagação em microssegundos
-log frames.txt   # registar bytes trocados
+off              # disconnect the link
+on               # reconnect
+ber 1e-4         # inject noise (bit error rate)
+prop 1000        # propagation delay in microseconds
+log frames.txt   # log exchanged bytes
 quit
 ```
 
-A transferência deve continuar a produzir um ficheiro idêntico ao original,
-mesmo com ligações interrompidas ou ruído.
+The transfer should still produce a file identical to the original, even with
+interrupted links or noise.
 
-## Testes
+## Tests
 
-Os helpers de framing têm testes independentes da máquina de estados:
+The framing helpers have tests that are independent of the state machine:
 
 ```bash
 cd lab1
@@ -137,10 +137,10 @@ gcc -Wall -Wextra -I src src/frame.c tests/selftest.c -o tests/selftest
 ./tests/selftest
 ```
 
-## Notas
+## Notes
 
-- `MAX_FILE_SIZE` é `0xFFFFFFFF` (4 GiB − 1) e o nome do ficheiro está limitado
-  a 255 caracteres.
-- Os ficheiros `main.c`, `link_layer.h`, `application_layer.h`,
-  `serial_port.*`, `cable/cable.c` e o `Makefile` são fornecidos no enunciado e
-  não devem ser alterados.
+- `MAX_FILE_SIZE` is `0xFFFFFFFF` (4 GiB − 1) and file names are limited to
+  255 characters.
+- `main.c`, `link_layer.h`, `application_layer.h`, `serial_port.*`,
+  `cable/cable.c` and the `Makefile` are provided with the assignment and must
+  not be changed.
