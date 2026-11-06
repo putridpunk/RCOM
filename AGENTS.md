@@ -3,7 +3,7 @@
 ## Do not delete or ignore `README.md`
 
 `README.md` at the repository root is required project documentation and is
-tracked by Git. AI coding agents must **not**:
+tracked by Git. AI coding agents must **not** (unless specifically asked to):
 
 - delete, rename, truncate, or replace it with a stub;
 - remove it from Git tracking (`git rm`) or add it to `.gitignore`;
