@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+<meta charset="utf-8">
+<title>Caracterização da eficiência de um protocolo de ligação Stop-and-Wait sobre uma ligação série</title>
+<style>
+  :root {
+    --ink: #1b2229;
+    --muted: #5f6b76;
+    --accent: #1f4e5a;
+    --gold: #a9853f;
+    --line: #dfe5ea;
+    --soft: #f5f8f9;
+  }
+
+  @page {
+    size: A4;
+    margin: 18mm 18mm 17mm 18mm;
+    @top-right {
+      content: "Caracterização da eficiência de um protocolo Stop-and-Wait";
+      font-family: "Segoe UI", sans-serif;
+      font-size: 7.4pt;
+      letter-spacing: .2px;
+      color: #8a949d;
+    }
+    @bottom-left {
+      content: "RCOM · Laboratório 1 · 2026/2027";
+      font-family: "Segoe UI", sans-serif;
+      font-size: 7.4pt;
+      color: #8a949d;
+    }
+    @bottom-right {
+      content: counter(page) " / " counter(pages);
+      font-family: "Segoe UI", sans-serif;
+      font-size: 7.6pt;
+      color: #8a949d;
+    }
+  }
+
+  @page:first {
+    @top-right { content: none; }
+  }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    margin: 0;
+    font-family: Cambria, "Palatino Linotype", "Times New Roman", serif;
+    font-size: 10pt;
+    line-height: 1.48;
+    color: var(--ink);
+  }
+
+  p {
+    margin: 0 0 5px;
+    text-align: justify;
+  }
+
+  i, em { font-style: italic; }
+  sup, sub { line-height: 0; font-size: 72%; }
+  sup { vertical-align: super; }
+  sub { vertical-align: sub; }
+
+  /* ---------------- Title block ---------------- */
+  .titleblock {
+    border-top: 3px solid var(--accent);
+    padding-top: 9px;
+    margin-bottom: 11px;
+  }
+  .kicker {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8pt;
+    letter-spacing: 1.8px;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 6px;
+  }
+  h1 {
+    font-family: Cambria, "Palatino Linotype", "Times New Roman", serif;
+    font-size: 20pt;
+    line-height: 1.16;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0 0 9px;
+    letter-spacing: -0.2px;
+    text-wrap: balance;
+  }
+  .authors {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 9.5pt;
+    color: #26343d;
+    margin-bottom: 2px;
+  }
+  .authors strong { font-weight: 600; }
+  .affiliation {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8.2pt;
+    line-height: 1.4;
+    color: var(--muted);
+    margin: 0;
+  }
+  .rule {
+    height: 1px;
+    background: var(--line);
+    margin: 10px 0 10px;
+  }
+
+  /* ---------------- Abstract ---------------- */
+  .abstract {
+    background: var(--soft);
+    border-left: 3px solid var(--gold);
+    padding: 8px 12px 7px;
+    margin: 0 0 13px;
+  }
+  .abstract .label {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8pt;
+    font-weight: 600;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 3px;
+  }
+  .abstract p {
+    font-size: 9.4pt;
+    line-height: 1.46;
+    margin: 0;
+  }
+
+  /* ---------------- Sections ---------------- */
+  h2 {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 12pt;
+    font-weight: 600;
+    color: var(--accent);
+    margin: 13px 0 6px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid var(--line);
+    break-after: avoid;
+  }
+  h2 .n {
+    color: var(--gold);
+    font-weight: 700;
+    margin-right: 5px;
+  }
+
+  .lead { margin-top: 0; }
+
+  /* ---------------- Equations ---------------- */
+  .equation {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2.6em;
+    margin: 7px 0 8px;
+    font-size: 10.4pt;
+    break-inside: avoid;
+  }
+  .equation .eqno {
+    position: absolute;
+    right: 0;
+    font-family: "Segoe UI", sans-serif;
+    font-size: 9pt;
+    color: var(--muted);
+  }
+  .frac {
+    display: inline-flex;
+    flex-direction: column;
+    vertical-align: middle;
+    text-align: center;
+    margin: 0 .22em;
+    line-height: 1.18;
+  }
+  .frac .num {
+    border-bottom: .8px solid currentColor;
+    padding: 0 .35em .04em;
+  }
+  .frac .den {
+    padding: .05em .35em 0;
+  }
+
+  /* ---------------- Figure ---------------- */
+  .figure {
+    margin: 9px 0 11px;
+    break-inside: avoid;
+  }
+  .figure .frame {
+    background: #fcfdfd;
+    border: 1px solid var(--line);
+    padding: 5px 7px 2px;
+  }
+  .figure img {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin: 0 auto;
+  }
+  .figure figcaption {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8.1pt;
+    line-height: 1.4;
+    color: var(--muted);
+    margin-top: 5px;
+    text-align: justify;
+  }
+  .figure figcaption b { color: var(--ink); }
+
+  /* ---------------- Table ---------------- */
+  .tableblock {
+    margin: 11px 0 12px;
+    break-inside: avoid;
+  }
+  .tableblock .tcap {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8.2pt;
+    line-height: 1.4;
+    color: var(--muted);
+    text-align: justify;
+    margin-bottom: 4px;
+  }
+  .tableblock .tcap b { color: var(--ink); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: "Segoe UI", sans-serif;
+    font-size: 8pt;
+    line-height: 1.25;
+  }
+  thead th {
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+    font-size: 7.7pt;
+    padding: 4px 5px;
+    text-align: right;
+    white-space: nowrap;
+  }
+  thead th:first-child,
+  thead th:nth-child(2) { text-align: left; }
+  tbody td {
+    padding: 3.1px 5px;
+    border-bottom: .7px solid var(--line);
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  tbody td.cfg { text-align: left; }
+  tbody td.grp {
+    font-size: 7.5pt;
+    letter-spacing: .5px;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    text-align: left;
+    vertical-align: top;
+  }
+  tbody:nth-of-type(even) td { background: #f8fafb; }
+  tbody tr:last-child td { border-bottom: 1.2px solid #b9c7cf; }
+  tbody:last-of-type tr:last-child td { border-bottom: 1.2px solid #b9c7cf; }
+  .tnote {
+    font-family: "Segoe UI", sans-serif;
+    font-size: 7.7pt;
+    color: var(--muted);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+  .star { color: var(--gold); font-weight: 700; }
+
+  /* ---------------- References ---------------- */
+  .refs {
+    list-style: none;
+    margin: 3px 0 0;
+    padding: 0;
+    font-size: 9.1pt;
+    line-height: 1.4;
+  }
+  .refs li {
+    margin-bottom: 3px;
+    padding-left: 18px;
+    position: relative;
+    text-align: left;
+  }
+  .refs .rn {
+    position: absolute;
+    left: 0;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .refs i { font-style: italic; }
+
+  .keep { break-inside: avoid; }
+  .nowrap { white-space: nowrap; }
+  .mono {
+    font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+    font-size: .92em;
+  }
+</style>
+</head>
+<body>
+
+<div class="titleblock">
+  <div class="kicker">Redes de Computadores · Laboratório 1 · 2026/2027</div>
+  <h1>Caracterização da eficiência de um protocolo de ligação Stop-and-Wait sobre uma ligação série</h1>
+  <div class="authors">
+    Afonso Moura (up202403939) · Pedro Santos (up202405319)
+  </div>
+  <p class="affiliation">
+    L.EIC · Turma 3 · Redes de Computadores 2026/2027 · Faculdade de Engenharia da Universidade do Porto
+  </p>
+</div>
+
+<div class="rule"></div>
+
+<div class="abstract">
+  <div class="label">Resumo</div>
+  <p>
+    Caracterizámos a eficiência do protocolo de ligação <i>Stop-and-Wait</i> do primeiro
+    trabalho laboratorial em 45 transferências de um ficheiro de 10&nbsp;968 bytes por uma
+    ligação série emulada, variando por ensaio a taxa de erro de bit, o atraso de
+    propagação, o débito nominal e o tamanho do quadro. Sem erros, a eficiência
+    <i>S</i> = <i>R</i>/<i>C</i> vale 0,7786, valor determinado pelo enquadramento e pela
+    codificação 8N1. A eficiência não varia com o débito e decresce com o atraso ao ritmo
+    de duas travessias por cada um dos 14 quadros de informação. O modelo de utilização
+    para janela unitária descreve o efeito do atraso com erro inferior a 0,3&nbsp;%. Com
+    BER 10<sup>−4</sup>, duas de três transferências esgotaram o orçamento de quatro
+    tentativas por quadro.
+  </p>
+</div>
+
+<h2><span class="n">1.</span>Introdução</h2>
+
+<p class="lead">
+  A camada de ligação implementada transporta quadros delimitados por 0x7E, com
+  <i>BCC</i><sub>1</sub> = <i>A</i> ⊕ <i>C</i> no cabeçalho e <i>BCC</i><sub>2</sub> como
+  XOR do campo de dados. O <i>stuffing</i> de 0x7E e 0x7D garante transparência. O
+  controlo de fluxo é <i>Stop-and-Wait</i> com numeração módulo 2, confirmações RR/REJ e
+  retransmissão temporizada. A camada de aplicação divide o ficheiro em pacotes START,
+  DATA e END, com metadados em TLV.
+</p>
+
+<p>
+  A janela unitária obriga o transmissor a aguardar uma ida-e-volta por quadro, o que
+  liga o desempenho ao atraso de propagação. Medimos a eficiência
+  <i>S</i> = <i>R</i>/<i>C</i>, com <i>R</i> o débito útil em bit/s e <i>C</i> o débito
+  nominal, em função de quatro parâmetros, e comparámos os resultados com os modelos de
+  ARQ.
+</p>
+
+<h2><span class="n">2.</span>Metodologia</h2>
+
+<p>
+  Fixámos os parâmetros do programa fornecido: quatro tentativas por quadro,
+  <span class="nowrap">TIMEOUT = 4 s</span> e carga útil máxima de 1000 bytes. O ficheiro
+  <span class="mono">penguin.gif</span> ocupa 10&nbsp;968 bytes e segue em 14 quadros de
+  informação, 12 DATA, um START e um END, que transportam 11&nbsp;048 bytes de carga útil.
+  A configuração base usa 9600 bit/s, BER nula, atraso nulo e 997 bytes por pacote. Cada
+  configuração foi repetida três vezes.
+</p>
+
+<p>
+  Os ensaios correram em Linux com <span class="mono">gcc</span> e
+  <span class="mono">socat</span> sobre o emulador de cabo fornecido. Confirmámos cada
+  comando do cabo no registo antes do seguinte e verificámos a configuração aplicada em
+  todas as execuções. A cópia do emulador recebeu semente distinta por processo, para que
+  as repetições não partilhassem a sequência pseudoaleatória.
+</p>
+
+<p>
+  A janela de medição começa antes do envio de START e termina quando o envio de END fica
+  confirmado, excluindo a abertura, o fecho e a espera final do temporizador. Uma
+  transferência conta como bem-sucedida quando o ficheiro recebido é idêntico ao original
+  byte a byte e o recetor confirma a conclusão. A instrumentação correu numa cópia
+  temporária do código-fonte, sem alterar quadros, temporizadores nem pacotes.
+</p>
+
+<p>
+  O modelo de utilização de <i>Stop-and-Wait</i> sem erros relaciona a fração de tempo
+  útil com a razão entre atraso e transmissão da carga útil de um quadro:
+</p>
+
+<div class="equation">
+  <span><i>U</i> = <span class="frac"><span class="num">1</span><span class="den">1 + 2<i>a</i></span></span></span>
+  <span><i>a</i> = <span class="frac"><span class="num"><i>T</i><sub>prop</sub></span><span class="den"><i>t</i><sub><i>I</i></sub></span></span></span>
+  <span class="eqno">(1)</span>
+</div>
+
+<p>
+  onde <i>t</i><sub><i>I</i></sub> = 8<i>L</i>/<i>C</i> é o tempo de transmissão da carga
+  útil de um quadro de <i>L</i> bytes. Com probabilidade de erro de quadro <i>p</i> e sem
+  limite de retransmissões, o modelo passa a
+  <i>U</i> = (1 − <i>p</i>)/(1 + 2<i>a</i>). Ambos assumem quadros uniformes e confirmações
+  de duração nula.
+</p>
+
+<div class="keep">
+<p>
+  Para a implementação usámos um segundo modelo, que separa serialização e propagação:
+</p>
+
+<div class="equation">
+  <span><i>T</i> = <span class="frac"><span class="num">10 <i>N</i><sub>fio</sub></span><span class="den"><i>C</i></span></span> + 2 <i>N</i><sub><i>I</i></sub> <i>T</i><sub>prop</sub></span>
+  <span><i>S</i> = <span class="frac"><span class="num">8 <i>N</i><sub><i>f</i></sub></span><span class="den"><i>C</i> <i>T</i></span></span></span>
+  <span class="eqno">(2)</span>
+</div>
+</div>
+
+<p>
+  <i>N</i><sub>fio</sub> conta os bytes escritos na ligação, incluindo quadros,
+  confirmações e <i>stuffing</i>; <i>N</i><sub><i>I</i></sub> é o número de quadros de
+  informação; <i>N</i><sub><i>f</i></sub> são os bytes do ficheiro; e o fator 10
+  corresponde aos bits por byte de 8N1.
+</p>
+
+<h2><span class="n">3.</span>Resultados</h2>
+
+<p>
+  Com 997 bytes de carga, <i>N</i><sub>fio</sub> = 11&nbsp;202 bytes, dos quais 11&nbsp;132
+  de quadros de informação e 70 de 14 confirmações. O <i>stuffing</i> acrescenta 68 bytes.
+  A eficiência de enquadramento vale 10&nbsp;968/11&nbsp;270 = 0,9732, donde
+  <i>S</i> = 0,8 × 0,9732 = 0,7786. Medimos 0,77856 ± 0,00001. Os 6 bytes de cabeçalho e
+  cauda por quadro, os 5 bytes por confirmação e a codificação 8N1 fixam este limite
+  superior.
+</p>
+
+<p>
+  O ajuste aos quatro pontos de atraso dá <i>T</i> = <i>T</i><sub>0</sub> + 28,02
+  <i>T</i><sub>prop</sub>, ou seja, 14 ciclos de ida-e-volta com duas travessias cada,
+  valor coerente com os 14 quadros de informação. O modelo (2) reproduz os tempos com
+  desvio inferior a 0,05&nbsp;%. O modelo (1), com η = 0,7786, aproxima os mesmos pontos
+  com desvio inferior a 0,3&nbsp;%. A diferença corresponde ao tempo de transmissão das
+  confirmações e do <i>stuffing</i>, que o modelo (1) despreza. Esse tempo é fixo, pelo que
+  o seu peso no ciclo diminui à medida que o atraso cresce.
+</p>
+
+<p>
+  A eficiência mantém-se em 0,7786 entre 4800 e 38&nbsp;400 bit/s e em 0,7785 a
+  115&nbsp;200 bit/s, enquanto o tempo de dados cai de 23,4792 s para 0,9784 s. Em cada
+  débito, a diferença entre o tempo medido e 10 <i>N</i><sub>fio</sub>/<i>C</i> corresponde
+  aos mesmos 68 bytes serializados. A sobrecarga é fixa em bytes e o aumento de débito não
+  altera <i>S</i>.
+</p>
+
+<p>
+  Com 50 ms de atraso, <i>S</i> sobe de 0,3750 com quadros de 100 bytes para 0,6953 com 997
+  bytes. O número de ciclos cai de 112 para 14 e o custo de propagação desce de 11,2 s para
+  1,4 s. O modelo (1) perde precisão neste estudo, com desvio que atinge 5,6&nbsp;% a 100
+  bytes, porque as confirmações passam a ocupar 4,4&nbsp;% dos bytes no fio. Entre 500 e
+  997 bytes o ganho reduz-se a 0,0558; o máximo de 1000 bytes imposto pela camada de
+  ligação limita o resto.
+</p>
+
+<p>
+  As retransmissões sobem de 0 para 5 com a BER e <i>S</i> cai de 0,7786 para 0,5365. A
+  expressão com erros aproxima os três primeiros pontos com desvio entre 2&nbsp;% e
+  3&nbsp;%. O desvio cresce com <i>p</i> porque o modelo ignora a corrupção das
+  confirmações e o TIMEOUT = 4 s que se segue a um REJ perdido. Com BER
+  10<sup>−4</sup> só uma de três transferências concluiu: um quadro de 1006 bytes tem
+  <i>p</i> = 0,553, a probabilidade de esgotar quatro tentativas é
+  <i>p</i><sup>4</sup> = 0,093 e a de pelo menos um dos 14 quadros falhar é
+  1 − (1 − 0,093)<sup>14</sup> ≈ 0,25. Para esse comprimento, as quatro taxas ensaiadas
+  correspondem a FER de 0,8&nbsp;%, 7,7&nbsp;%, 21,5&nbsp;% e 55,3&nbsp;%.
+</p>
+
+<figure class="figure">
+  <div class="frame">
+    <img src="figura1.png" alt="Eficiência medida e prevista pelo modelo em função do atraso, débito, tamanho do quadro e taxa de erro">
+  </div>
+  <figcaption>
+    <b>Figura 1.</b> Eficiência medida (marcadores) e prevista pelo modelo (tracejado):
+    (a) atraso de propagação; (b) débito nominal; (c) tamanho do quadro com 50 ms de
+    atraso; (d) taxa de erro, com barras de desvio-padrão de três repetições. O ponto a
+    10<sup>−4</sup> aparece a traço interrompido por estar condicionado ao sucesso.
+  </figcaption>
+</figure>
+
+<div class="tableblock">
+  <div class="tcap">
+    <b>Tabela 1.</b> Tempo da janela de dados, débito útil, eficiência medida e previsão do
+    modelo (2). O tempo é a média aritmética das três execuções; <i>R</i> e <i>S</i>
+    resultam da média dos débitos e das eficiências por execução.
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Estudo</th>
+        <th>Configuração</th>
+        <th><i>N</i><sub><i>I</i></sub></th>
+        <th><i>T</i> (s)</th>
+        <th><i>R</i> (bit/s)</th>
+        <th><i>S</i> medido</th>
+        <th><i>S</i> modelo</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td rowspan="4" class="grp">atraso</td>
+        <td class="cfg">0 ms</td><td>14</td><td>11,7396</td><td>7&nbsp;474</td><td>0,7786</td><td>0,7786</td>
+      </tr>
+      <tr><td class="cfg">50 ms</td><td>14</td><td>13,1458</td><td>6&nbsp;675</td><td>0,6953</td><td>0,6956</td></tr>
+      <tr><td class="cfg">100 ms</td><td>14</td><td>14,5458</td><td>6&nbsp;032</td><td>0,6284</td><td>0,6286</td></tr>
+      <tr><td class="cfg">250 ms</td><td>14</td><td>18,7458</td><td>4&nbsp;681</td><td>0,4876</td><td>0,4878</td></tr>
+    </tbody>
+
+    <tbody>
+      <tr>
+        <td rowspan="2" class="grp">débito</td>
+        <td class="cfg">4800 bit/s</td><td>14</td><td>23,4792</td><td>3&nbsp;737</td><td>0,7786</td><td>0,7786</td>
+      </tr>
+      <tr><td class="cfg">115200 bit/s</td><td>14</td><td>0,9784</td><td>89&nbsp;678</td><td>0,7785</td><td>0,7786</td></tr>
+    </tbody>
+
+    <tbody>
+      <tr>
+        <td rowspan="3" class="grp">quadro</td>
+        <td class="cfg">100 B</td><td>112</td><td>24,3760</td><td>3&nbsp;600</td><td>0,3750</td><td>0,3751</td>
+      </tr>
+      <tr><td class="cfg">250 B</td><td>46</td><td>16,8104</td><td>5&nbsp;220</td><td>0,5437</td><td>0,5438</td></tr>
+      <tr><td class="cfg">997 B</td><td>14</td><td>13,1458</td><td>6&nbsp;675</td><td>0,6953</td><td>0,6956</td></tr>
+    </tbody>
+
+    <tbody>
+      <tr>
+        <td rowspan="4" class="grp">BER</td>
+        <td class="cfg">10<sup>−6</sup></td><td>14</td><td>12,0931</td><td>7&nbsp;268</td><td>0,7571</td><td>0,7724</td>
+      </tr>
+      <tr><td class="cfg">10<sup>−5</sup></td><td>14</td><td>13,1510</td><td>6&nbsp;738</td><td>0,7019</td><td>0,7184</td></tr>
+      <tr><td class="cfg">3×10<sup>−5</sup></td><td>14</td><td>15,6236</td><td>5&nbsp;687</td><td>0,5924</td><td>0,6116</td></tr>
+      <tr><td class="cfg">10<sup>−4</sup><span class="star">*</span></td><td>14</td><td>17,0375</td><td>5&nbsp;150</td><td>0,5365</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="tnote">
+    <span class="star">*</span> Uma de três transferências concluiu. O valor está
+    condicionado ao sucesso.
+  </div>
+</div>
+
+<h2><span class="n">4.</span>Conclusões</h2>
+
+<p>
+  Na configuração base o protocolo atinge 0,7786 de eficiência. Esse valor decorre do
+  enquadramento e da codificação 8N1, mantém-se constante com o débito, desce com o atraso
+  ao ritmo de duas travessias por quadro e cresce com o tamanho do quadro até ao limite de
+  enquadramento. O modelo (2) prevê os tempos com desvio inferior a 0,05&nbsp;% nos três
+  estudos determinísticos e isola o <i>stuffing</i> como único resíduo sistemático, com 68
+  bytes.
+</p>
+
+<p>
+  Os modelos de ARQ têm âmbitos distintos. O modelo (1) descreve o atraso com erro
+  inferior a 0,3&nbsp;%, mas perde precisão quando as confirmações deixam de ser
+  desprezáveis, como sucede com quadros de 100 bytes. A expressão com erros subestima o
+  custo entre 2&nbsp;% e 3&nbsp;%, por ignorar o temporizador de 4 s que se segue a uma
+  confirmação perdida. A partir de BER 10<sup>−4</sup> com quadros de 1000 bytes, quatro
+  tentativas por quadro deixam de garantir uma transferência completa: concluiu uma de
+  três.
+</p>
+
+<p>
+  Uma janela deslizante reduziria o custo de propagação de 28 travessias para poucas por
+  transferência e tornaria a eficiência dependente da capacidade em vez do atraso. Um CRC
+  de 16 ou 32 bits reduziria o erro residual face ao XOR, ao custo de mais bytes por
+  quadro.
+</p>
+
+<h2>Referências</h2>
+
+<ol class="refs">
+  <li><span class="rn">[1]</span> FEUP, <i>Redes de Computadores 2026/2027: Laboratório 1, Data Link Protocol</i>, guião, 2026.</li>
+  <li><span class="rn">[2]</span> FEUP, <i>Caracterização da eficiência do protocolo</i>, enunciado do relatório, 2026.</li>
+  <li><span class="rn">[3]</span> J. F. Kurose, K. W. Ross, <i>Computer Networking: A Top-Down Approach</i>, 8.ª ed., Pearson, 2021, cap. 3.</li>
+  <li><span class="rn">[4]</span> A. S. Tanenbaum, N. Feamster, D. J. Wetherall, <i>Computer Networks</i>, 6.ª ed., Pearson, 2021, cap. 3.</li>
+</ol>
+
+</body>
+</html>
