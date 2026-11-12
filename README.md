@@ -2,35 +2,46 @@
 
 Course project for **Computer Networks** in the 3rd year of **L.EIC** at FEUP.
 
-The aim is to implement reliable file transfer over a serial link using a
-provided serial-port API: the **link layer** (framing, error control,
-retransmissions) and a simple **application protocol** (control and data
-packets) built on top of it.
+The repository contains the two RCOM lab assignments:
 
-> The code uses `termios`, `alarm(2)`/`SIGALRM` and `socat`, so it only runs on
-> Linux, macOS or WSL — not on native Windows.
+- **Lab 1** — reliable file transfer over a serial link: the **link layer**
+  (framing, error control, retransmissions) and a simple **application
+  protocol** (control and data packets) built on top of it.
+- **Lab 2** — a simple **FTP download client** (Part 1) and the network
+  configuration and analysis experiments (Part 2).
+
+> Both labs use POSIX APIs (and Lab 1 also uses `termios`, `alarm(2)`/`SIGALRM`
+> and `socat`), so they only run on Linux, macOS or WSL — not on native
+> Windows.
 
 ## Repository structure
 
 ```
 .
 ├── README.md
-└── lab1/
-    ├── src/            # implementation (link layer + application)
-    │   ├── main.c             # argument parsing (do not change)
-    │   ├── link_layer.c/.h    # link protocol: SET/UA, I, RR/REJ, DISC
-    │   ├── frame.c/.h         # pure framing, BCC and byte-stuffing helpers
-    │   ├── application_layer.c/.h  # START/DATA/END packets and TLVs
-    │   ├── serial_port.c/.h   # serial-port API (do not change)
-    │   └── alarm_sigaction.c/.h    # timeouts via alarm(2)
-    ├── cable/cable.c   # virtual cable (do not change)
-    ├── tests/selftest.c # tests for the framing helpers
-    ├── Makefile        # build and run targets (do not change)
-    ├── penguin.gif     # sample file
-    └── README.txt      # original lab assignment
+├── lab1/
+│   ├── src/            # implementation (link layer + application)
+│   │   ├── main.c             # argument parsing (do not change)
+│   │   ├── link_layer.c/.h    # link protocol: SET/UA, I, RR/REJ, DISC
+│   │   ├── frame.c/.h         # pure framing, BCC and byte-stuffing helpers
+│   │   ├── application_layer.c/.h  # START/DATA/END packets and TLVs
+│   │   ├── serial_port.c/.h   # serial-port API (do not change)
+│   │   └── alarm_sigaction.c/.h    # timeouts via alarm(2)
+│   ├── cable/cable.c   # virtual cable (do not change)
+│   ├── tests/selftest.c # tests for the framing helpers
+│   ├── Makefile        # build and run targets (do not change)
+│   ├── penguin.gif     # sample file
+│   └── README.txt      # original lab assignment
+└── lab2/
+    ├── download.c      # FTP download client (Part 1)
+    ├── clientTCP.c     # course-provided TCP example (do not change)
+    ├── getip.c         # course-provided DNS example (do not change)
+    ├── Makefile        # builds ./download
+    ├── README.md       # Lab 2 build/run and architecture notes
+    └── docs/           # local course PDFs (ignored by Git)
 ```
 
-## Implemented protocol
+## Lab 1 — serial link file transfer
 
 ### Link layer (`src/link_layer.c`)
 
@@ -77,14 +88,14 @@ that the received size matches the announced one. `MAX_PAYLOAD_SIZE` is 1000
 bytes; the data chunk size can be changed at compile time with
 `-DAPP_DATA_CHUNK=...` (used for efficiency measurements).
 
-## Building
+### Building
 
 ```bash
 cd lab1
 make            # builds bin/main and bin/cable
 ```
 
-## Running
+### Running
 
 [`socat`](https://linux.die.net/man/1/socat) is required for the virtual cable.
 
@@ -111,7 +122,7 @@ Running the executable directly:
 `nTries = 3` and `timeout = 4 s` are defined in `src/main.c`; the supported baud
 rates are 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600 and 115200.
 
-### Testing with errors
+#### Testing with errors
 
 With the virtual cable running, enter commands in its terminal:
 
@@ -127,7 +138,7 @@ quit
 The transfer should still produce a file identical to the original, even with
 interrupted links or noise.
 
-## Tests
+### Tests
 
 The framing helpers have tests that are independent of the state machine:
 
@@ -137,10 +148,36 @@ gcc -Wall -Wextra -I src src/frame.c tests/selftest.c -o tests/selftest
 ./tests/selftest
 ```
 
-## Notes
+### Notes
 
 - `MAX_FILE_SIZE` is `0xFFFFFFFF` (4 GiB − 1) and file names are limited to
   255 characters.
 - `main.c`, `link_layer.h`, `application_layer.h`, `serial_port.*`,
   `cable/cable.c` and the `Makefile` are provided with the assignment and must
   not be changed.
+
+## Lab 2 — FTP download client
+
+Only the **first class** of Lab 2 is implemented here: Part 1, the download
+application. Part 2 (network configuration experiments 1–6) is laboratory
+bench work and is not part of this code.
+
+`lab2/download.c` implements the Part 1 download application: it parses an
+`ftp://` URL, resolves the host, logs in, enters passive mode and retrieves a
+single file into the current directory. The course-provided `clientTCP.c` and
+`getip.c` remain unchanged as reference examples.
+
+```bash
+cd lab2
+make
+./download ftp://demo:password@test.rebex.net/readme.txt
+```
+
+Anonymous access is the default when the URL has no user information. The
+NetLab server (`ftp.netlab.fe.up.pt`) is only reachable from the lab network.
+
+See [`lab2/README.md`](lab2/README.md) for the architecture, the full URL
+syntax and the list of test URLs.
+
+The course PDFs (`lab2/docs/`) are kept locally for reference and ignored by
+Git.

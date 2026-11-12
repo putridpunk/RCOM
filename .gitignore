@@ -1,0 +1,6 @@
+# Local course material (PDFs supplied with the assignments)
+/lab2/docs/
+
+# Lab 2 build artifacts
+/lab2/download
+/lab2/*.o
