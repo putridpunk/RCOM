@@ -167,6 +167,19 @@ bench work and is not part of this code.
 single file into the current directory. The course-provided `clientTCP.c` and
 `getip.c` remain unchanged as reference examples.
 
+### Current state
+
+- **Lab 2 Part 1 (first class): implemented.** The client supports anonymous
+  and user/password login, binary transfers, `PWD`-independent path handling
+  through `CWD` with an absolute fallback, passive mode and local file saving.
+- **Build:** `make` completes without warnings under WSL with GCC 13.
+- **Tested:** `ftp://demo:password@test.rebex.net/readme.txt` (379 bytes) and
+  `ftp://ftp.up.pt/pub/debian/README` (1198 bytes).
+- **Pending:** the NetLab server tests must be run inside the I322 laboratory
+  network with the bench configured for experiment 6.
+- **Not started:** Lab 2 Part 2 (network configuration and analysis,
+  experiments 1–6).
+
 ```bash
 cd lab2
 make
